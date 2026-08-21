@@ -10,6 +10,8 @@ A lightweight, serverless, and privacy-first AI terminal client (TUI) with a bui
 
 This is a **native terminal client** (`traliran-hub`) written in C11 (ncurses + libcurl): chat with streaming + thinking blocks, multi-model compare, AI IDE with an on-disk workspace and version control, notes, assistant store, and settings. It connects directly to the same providers (Groq, Gemini, OpenAI, OpenRouter, DeepSeek, Qwen, GLM, Claude, Ollama, Llama.cpp).
 
+<img width="1889" height="974" alt="image" src="https://github.com/user-attachments/assets/558cedb4-05bc-4ebc-a1bd-325eaa68126f" />
+
 ### Dependencies
 * A C11 compiler (gcc/clang) and `make`
 * `ncursesw` and `libcurl` development packages
@@ -44,6 +46,10 @@ On first run the app creates `~/.cache/traliran-cache/` (config/notes/sessions s
 
 Plain-character program hotkeys (`q`, `?`, `1..6`, Tab, IDE `x`) fire only after **3 rapid presses within 1 second**, so typing text never triggers them accidentally. F-keys and Ctrl combos fire immediately.
 | Settings | Up/Down select · Enter edit · Esc back |
+
+<img width="1903" height="977" alt="image" src="https://github.com/user-attachments/assets/1b3e1d8b-9699-4e0e-a961-f8d6be59a7a8" />
+<img width="1904" height="970" alt="image" src="https://github.com/user-attachments/assets/542b3c14-4ed9-4728-aec1-c324a509d479" />
+<img width="1901" height="978" alt="image" src="https://github.com/user-attachments/assets/eb66c584-4d66-41eb-be24-abcda1927822" />
 
 ### Vim mode
 Press **F12** to toggle vim-like navigation (shown in the status bar). In normal mode `h/j/k/l` move, `i`/`a` enter insert mode, `Esc` returns to normal mode. The setting persists in `~/.cache/traliran-cache/storage.json`.
