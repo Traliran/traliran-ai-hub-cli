@@ -1,0 +1,2060 @@
+/*
+ * app.c - Traliran AI Hub CLI: screen management, main loop, UI logic.
+ */
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <signal.h>
+#include <unistd.h>
+
+#include "cJSON.h"
+#include "util.h"
+#include "storage.h"
+#include "providers.h"
+#include "config.h"
+#include "http.h"
+#include "markdown.h"
+#include "tui.h"
+#include "job.h"
+#include "chat.h"
+#include "notes.h"
+#include "store.h"
+#include "rag.h"
+#include "ide.h"
+#include "sandbox.h"
+#include "app.h"
+
+#ifndef KEY_CTRL
+#define KEY_CTRL(c) ((c) & 0x1f)
+#endif
+
+/* =================== global state =================== */
+
+volatile int app_quit;
+
+static screen_t g_screen = SCREEN_CHAT;
+
+static job_t g_job;
+static volatile int g_job_stop;
+static stream_t *g_active_stream;
+static mm_arg_t *g_active_mm;
+static bool g_debate_mode;
+
+static chat_t g_chat;
+static notes_t g_notes;
+static store_t g_store;
+static mv_t g_chat_view;
+static int g_view_msg_count;
+static input_t g_chat_input;
+
+static char g_attach_name[512];
+static char *g_attach_content;
+
+static char **g_models;
+static int g_nmodels;
+static char **g_multi;
+static int g_nmulti;
+
+static int g_last_tokens;
+static double g_last_cost;
+static bool g_streaming;
+
+/* notes */
+static input_t g_note_title;
+static editor_t g_note_editor;
+static int g_note_preview;
+static mv_t g_note_preview_view;
+
+/* ide */
+static char *g_ide_open[64];
+static int g_ide_nopen;
+static char g_ide_active[512];
+static editor_t g_ide_editor;
+static int g_ide_left_tab;
+static int g_ide_focus;          /* 0 editor, 1 agent input */
+static agent_chat_t g_agent_chat;
+static mv_t g_agent_view;
+static input_t g_agent_input;
+static progress_t g_progress;
+
+/* settings */
+static int g_settings_sel;
+
+/* store */
+static int g_store_sel;
+
+/* vim-like navigation mode */
+static bool g_vim_mode;
+static bool g_vim_insert;
+
+static WINDOW *w_tabbar, *w_status, *w_main;
+
+/* =================== layout =================== */
+
+#define TAB_H 1
+#define STATUS_H 1
+
+static int area_y(void) { return TAB_H; }
+static int area_h(void) { return LINES - TAB_H - STATUS_H; }
+
+/* =================== job ui loop =================== */
+
+static void run_job_ui(void) {
+    while (!job_is_done(&g_job)) {
+        draw_all();
+        nodelay(stdscr, TRUE);
+        timeout(80);
+        int ch = getch();
+        if (ch == 27 || ch == 'q') {
+            g_job_stop = 1;
+            if (g_active_stream) {
+                pthread_mutex_lock(&g_active_stream->mtx);
+                g_active_stream->stop = 1;
+                pthread_mutex_unlock(&g_active_stream->mtx);
+            }
+            if (g_active_mm) g_active_mm->stop = 1;
+        }
+    }
+    timeout(-1);
+    nodelay(stdscr, FALSE);
+}
+
+/* =================== model fetching =================== */
+
+static void models_free(void) {
+    for (int i = 0; i < g_nmodels; i++) free(g_models[i]);
+    free(g_models);
+    g_models = NULL;
+    g_nmodels = 0;
+}
+
+static void multi_free(void) {
+    for (int i = 0; i < g_nmulti; i++) free(g_multi[i]);
+    free(g_multi);
+    g_multi = NULL;
+    g_nmulti = 0;
+}
+
+static void fetch_models(void) {
+    models_free();
+    const provider_t *pr = providers_get(g_cfg.provider);
+    if (!strcmp(g_cfg.provider, "claude")) {
+        static const char *fallback[] = {
+            "claude-3-5-sonnet-latest", "claude-3-7-sonnet-latest", "claude-3-5-haiku-latest"
+        };
+        g_models = calloc(3, sizeof(char *));
+        for (int i = 0; i < 3; i++) g_models[g_nmodels++] = xstrdup(fallback[i]);
+        if (!g_cfg.selected_model[0]) {
+            snprintf(g_cfg.selected_model, sizeof(g_cfg.selected_model), "%s", g_models[0]);
+        }
+        return;
+    }
+    if (pr->has_key && !g_cfg.api_key[0]) return;
+
+    char url[2048];
+    snprintf(url, sizeof(url), "%s/models", config_endpoint());
+    http_res_t *r = http_get(url, g_cfg.api_key);
+    if (!r || !r->ok) {
+        if (r) http_res_free(r);
+        return;
+    }
+    cJSON *j = cJSON_Parse(r->body);
+    if (j) {
+        cJSON *data = cJSON_GetObjectItem(j, "data");
+        cJSON *arr = data && cJSON_IsArray(data) ? data : (cJSON_IsArray(j) ? j : NULL);
+        if (arr) {
+            int n = cJSON_GetArraySize(arr);
+            for (int i = 0; i < n; i++) {
+                cJSON *item = cJSON_GetArrayItem(arr, i);
+                cJSON *id = cJSON_GetObjectItem(item, "id");
+                cJSON *nm = cJSON_GetObjectItem(item, "name");
+                const char *mid = id && cJSON_IsString(id) ? id->valuestring
+                               : (nm && cJSON_IsString(nm) ? nm->valuestring : NULL);
+                if (!mid) continue;
+                char lower[1024];
+                snprintf(lower, sizeof(lower), "%s", mid);
+                str_tolower(lower);
+                if (strstr(lower, "whisper") || strstr(lower, "tts") ||
+                    strstr(lower, "embed") || strstr(lower, "guard"))
+                    continue;
+                g_models = realloc(g_models, sizeof(char *) * (size_t)(g_nmodels + 1));
+                g_models[g_nmodels++] = xstrdup(mid);
+            }
+        }
+        cJSON_Delete(j);
+    }
+    http_res_free(r);
+
+    if (g_nmodels > 0 && !g_cfg.selected_model[0]) {
+        snprintf(g_cfg.selected_model, sizeof(g_cfg.selected_model), "%s", g_models[0]);
+    }
+    if (g_nmodels > 0 && g_cfg.selected_model[0]) {
+        bool found = false;
+        for (int i = 0; i < g_nmodels; i++)
+            if (!strcmp(g_models[i], g_cfg.selected_model)) { found = true; break; }
+        if (!found) snprintf(g_cfg.selected_model, sizeof(g_cfg.selected_model), "%s", g_models[0]);
+    }
+}
+
+/* =================== chat view =================== */
+
+static void chat_rebuild_view(bool force) {
+    session_t *s = chat_current(&g_chat);
+    int count = s ? s->n : 0;
+    if (!force && g_view_msg_count == count) return;
+    g_view_msg_count = count;
+    mv_clear(&g_chat_view);
+    if (!s) return;
+    for (int i = 0; i < s->n; i++) {
+        msg_t *m = &s->messages[i];
+        const char *sender = !strcmp(m->role, "user") ? "You" : (s->bot_name[0] ? s->bot_name : "AI");
+        mv_add_sender(&g_chat_view, sender, !strcmp(m->role, "user") ? MD_GREEN : MD_ACCENT);
+        mv_add_md(&g_chat_view, m->content, !strcmp(m->role, "user"));
+    }
+    g_chat_view.top = g_chat_view.nrow;
+}
+
+/* =================== chat actions =================== */
+
+static void chat_new_session(void) {
+    chat_new(&g_chat);
+    chat_save(&g_chat);
+    g_view_msg_count = -1;
+}
+
+static void chat_attach(void) {
+    char path[4096];
+    if (!tui_pick_file("Attach file", path, sizeof(path))) return;
+    char *content = read_file(path);
+    free(g_attach_content);
+    g_attach_content = NULL;
+    g_attach_name[0] = '\0';
+    const char *lower = path;
+    (void)lower;
+    /* detect media by extension */
+    char lowerpath[4096];
+    snprintf(lowerpath, sizeof(lowerpath), "%s", path);
+    str_tolower(lowerpath);
+    if (strstr(lowerpath, ".png") || strstr(lowerpath, ".jpg") || strstr(lowerpath, ".jpeg") ||
+        strstr(lowerpath, ".gif") || strstr(lowerpath, ".webp") || strstr(lowerpath, ".mp4") ||
+        strstr(lowerpath, ".webm")) {
+        snprintf(g_attach_name, sizeof(g_attach_name), "%.*s", (int)sizeof(g_attach_name) - 1, path);
+        g_attach_content = xstrdup("[Image/Video attachment]");
+        free(content);
+    } else {
+        const char *slash = strrchr(path, '/');
+        snprintf(g_attach_name, sizeof(g_attach_name), "%.*s", (int)sizeof(g_attach_name) - 1, slash ? slash + 1 : path);
+        g_attach_content = content ? content : xstrdup("");
+    }
+    if (!g_attach_content) g_attach_content = xstrdup("");
+}
+
+static bool chat_validate(void) {
+    if (!config_has_key()) {
+        tui_alert("Please enter your API key in Settings (press 5).");
+        return false;
+    }
+    if (g_nmulti == 0 && !g_cfg.selected_model[0]) {
+        tui_alert("Please select an AI model (fetch models in Settings).");
+        return false;
+    }
+    return true;
+}
+
+static void chat_send_single(session_t *s, const char *model) {
+    send_arg_t *a = calloc(1, sizeof(*a));
+    a->session = s;
+    a->model = xstrdup(model);
+    stream_init(&a->stream);
+    g_active_stream = &a->stream;
+    g_job_stop = 0;
+    job_start(&g_job, send_worker, a);
+    run_job_ui();
+    job_join(&g_job);
+    g_active_stream = NULL;
+
+    stream_t *st = &a->stream;
+    if (st->error) {
+        char *err = xasprintf("Execution Interrupted: %s", st->error);
+        chat_msg_push(s, "assistant", err);
+        free(err);
+    } else if (st->stop) {
+        chat_msg_push(s, "assistant", "_Generation stopped by user._");
+    } else {
+        char *content = stream_snapshot_content(st);
+        char *reasoning = stream_snapshot_reasoning(st);
+        char *final;
+        if (reasoning && reasoning[0])
+            final = xasprintf(" thinking%s response\n%s", reasoning, content);
+        else
+            final = xstrdup(content);
+        chat_msg_push(s, "assistant", final);
+        free(content);
+        free(reasoning);
+        free(final);
+        g_last_tokens = (int)estimate_tokens(s->messages[s->n - 2].content) +
+                        (int)estimate_tokens(s->messages[s->n - 1].content);
+        g_last_cost = (g_last_tokens / 1000.0) * 0.03;
+    }
+    chat_save(&g_chat);
+    chat_rebuild_view(true);
+    stream_free(st);
+    free(a->model);
+    free(a);
+}
+
+static void chat_send_multi(session_t *s) {
+    /* build messages json */
+    cJSON *arr = cJSON_CreateArray();
+    if (s->system_prompt[0]) {
+        cJSON *m = cJSON_CreateObject();
+        cJSON_AddStringToObject(m, "role", "system");
+        cJSON_AddStringToObject(m, "content", s->system_prompt);
+        cJSON_AddItemToArray(arr, m);
+    }
+    for (int i = 0; i < s->n; i++) {
+        cJSON *m = cJSON_CreateObject();
+        cJSON_AddStringToObject(m, "role", s->messages[i].role);
+        cJSON_AddStringToObject(m, "content", s->messages[i].content);
+        cJSON_AddItemToArray(arr, m);
+    }
+    char *msgs = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
+
+    mm_arg_t *all = calloc(1, sizeof(*all));
+    all->models = calloc((size_t)g_nmulti, sizeof(char *));
+    all->nmodels = g_nmulti;
+    all->messages_json = msgs;
+    all->temperature = g_cfg.temperature;
+    all->top_p = g_cfg.top_p;
+    all->max_tokens = g_cfg.max_tokens;
+    all->results = calloc((size_t)g_nmulti, sizeof(mm_result_t));
+    for (int i = 0; i < g_nmulti; i++) {
+        all->models[i] = xstrdup(g_multi[i]);
+        all->results[i].model = xstrdup(g_multi[i]);
+    }
+    g_active_mm = all;
+    g_job_stop = 0;
+    job_start(&g_job, multi_worker, all);
+    run_job_ui();
+    job_join(&g_job);
+    g_active_mm = NULL;
+
+    sbuf_t md;
+    sbuf_init(&md);
+    sbuf_append(&md, "### Multi-Model Performance Comparison\n\n");
+    for (int i = 0; i < all->nmodels; i++) {
+        mm_result_t *r = &all->results[i];
+        sbuf_appendf(&md, "#### Model: `%s`\n\n", r->model);
+        if (r->err) {
+            sbuf_appendf(&md, "Error: `%s`\n\n---\n", r->errmsg ? r->errmsg : "API error");
+        } else {
+            if (r->res.reasoning && r->res.reasoning[0]) {
+                sbuf_appendf(&md, "**Reasoning Log:**\n%s\n\n", r->res.reasoning);
+            }
+            sbuf_appendf(&md, "%s\n\n---\n", r->res.content ? r->res.content : "");
+        }
+        api_result_free(&r->res);
+        free(r->errmsg);
+        free(r->model);
+    }
+    chat_msg_push(s, "assistant", md.s);
+    g_last_tokens = (int)estimate_tokens(msgs) + (int)estimate_tokens(md.s);
+    g_last_cost = (g_last_tokens / 1000.0) * 0.03;
+    sbuf_free(&md);
+
+    free(msgs);
+    for (int i = 0; i < all->nmodels; i++) free(all->models[i]);
+    free(all->models);
+    free(all->results);
+    free(all);
+
+    chat_save(&g_chat);
+    chat_rebuild_view(true);
+}
+
+static void chat_send(void) {
+    session_t *s = chat_current(&g_chat);
+    if (!s) return;
+    char *text = str_dup_trim(g_chat_input.buf);
+    if (!text[0] && !g_attach_content) { free(text); return; }
+    if (!chat_validate()) { free(text); return; }
+
+    /* build user content */
+    char *user_content;
+    if (g_attach_content) {
+        if (!text[0]) {
+            user_content = xasprintf("[Attached File: %s]\n```\n%s\n```", g_attach_name, g_attach_content);
+        } else {
+            user_content = xasprintf("%s\n\n[Attached File: %s]\n```\n%s\n```", text, g_attach_name, g_attach_content);
+        }
+    } else {
+        user_content = xstrdup(text);
+    }
+
+    /* auto-name session */
+    if (str_has_prefix(s->name, "Chat #")) {
+        size_t n = strlen(text);
+        if (n > 24) n = 24;
+        char *nm = xstrndup(text, n);
+        free(s->name);
+        s->name = xasprintf("%s...", nm);
+        free(nm);
+    }
+
+    char *sys = chat_build_system(text);
+    char *bot = str_dup_trim(g_cfg.bot_name);
+    chat_set_session_prompt(s, sys, bot);
+    free(sys);
+    free(bot);
+
+    chat_msg_push(s, "user", user_content);
+    free(user_content);
+    chat_save(&g_chat);
+    chat_rebuild_view(true);
+
+    free(g_attach_content);
+    g_attach_content = NULL;
+    g_attach_name[0] = '\0';
+    in_set(&g_chat_input, "");
+
+    if (g_nmulti > 0) {
+        chat_send_multi(s);
+    } else {
+        chat_send_single(s, g_cfg.selected_model);
+    }
+}
+
+static void chat_regenerate(void) {
+    session_t *s = chat_current(&g_chat);
+    if (!s) return;
+    int last_assistant = -1;
+    for (int i = 0; i < s->n; i++)
+        if (!strcmp(s->messages[i].role, "assistant")) last_assistant = i;
+    if (last_assistant < 1) return;   /* need a preceding user message */
+    for (int i = last_assistant; i < s->n; i++) {
+        free(s->messages[i].role);
+        free(s->messages[i].content);
+    }
+    s->n = last_assistant;
+    chat_save(&g_chat);
+    chat_rebuild_view(true);
+
+    if (!chat_validate()) return;
+    if (g_nmulti > 0) chat_send_multi(s);
+    else chat_send_single(s, g_cfg.selected_model);
+}
+
+static void chat_summarize(void) {
+    session_t *s = chat_current(&g_chat);
+    if (!s) return;
+    if (chat_count_assistant(s) < 2) {
+        tui_alert("Need at least 2 AI responses to summarize.");
+        return;
+    }
+    if (!config_has_key() || !g_cfg.selected_model[0]) {
+        tui_alert("Configure API key and model first.");
+        return;
+    }
+    cJSON *arr = cJSON_CreateArray();
+    cJSON *sys = cJSON_CreateObject();
+    cJSON_AddStringToObject(sys, "role", "system");
+    cJSON_AddStringToObject(sys, "content",
+        "You are a conversation summarizer. Create a concise but comprehensive summary of this conversation. Focus on: 1) Key topics discussed, 2) Important decisions or conclusions, 3) User preferences and goals revealed. Format as structured text suitable for a \"Personal AI\" context field.");
+    cJSON_AddItemToArray(arr, sys);
+    for (int i = 0; i < s->n; i++) {
+        if (strcmp(s->messages[i].role, "user") && strcmp(s->messages[i].role, "assistant")) continue;
+        cJSON *m = cJSON_CreateObject();
+        cJSON_AddStringToObject(m, "role", s->messages[i].role);
+        cJSON_AddStringToObject(m, "content", s->messages[i].content);
+        cJSON_AddItemToArray(arr, m);
+    }
+    char *msgs = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
+
+    simple_arg_t *a = calloc(1, sizeof(*a));
+    a->model = xstrdup(g_cfg.selected_model);
+    a->messages_json = msgs;
+    a->temperature = 0.3;
+    a->top_p = g_cfg.top_p;
+    a->max_tokens = 500;
+    g_job_stop = 0;
+    job_start(&g_job, simple_complete_worker, a);
+    run_job_ui();
+    job_join(&g_job);
+
+    if (a->res.content && a->res.content[0]) {
+        char *new_info;
+        if (g_cfg.personal_info[0]) {
+            new_info = xasprintf("%s\n\n--- Conversation Summary ---\n%s", g_cfg.personal_info, a->res.content);
+        } else {
+            new_info = xasprintf("--- Conversation Summary ---\n%s", a->res.content);
+        }
+        snprintf(g_cfg.personal_info, sizeof(g_cfg.personal_info), "%s", new_info);
+        free(new_info);
+        config_save();
+        tui_alert("Summary added to your Personal Info.");
+    } else {
+        tui_alert("Failed to summarize: empty response.");
+    }
+    api_result_free(&a->res);
+    free(a->model);
+    free(a->messages_json);
+    free(a);
+}
+
+static void chat_debate(void) {
+    char idea[4096];
+    if (!tui_prompt("Group debate - enter your thesis/idea", "", idea, sizeof(idea))) return;
+    char *t = str_dup_trim(idea);
+    if (!t[0]) { free(t); return; }
+    if (!config_has_key() || !g_cfg.selected_model[0]) {
+        free(t);
+        tui_alert("Configure API key and model first.");
+        return;
+    }
+
+    chat_new(&g_chat);
+    session_t *s = chat_current(&g_chat);
+    free(s->name);
+    size_t n = strlen(t);
+    if (n > 20) n = 20;
+    s->name = xasprintf("Debate: %.*s...", (int)n, t);
+    chat_set_session_prompt(s, chat_build_system(t), "Hub Comparator");
+    chat_msg_push(s, "user", xasprintf("Proposition for debate:\n%s", t));
+    chat_save(&g_chat);
+    chat_rebuild_view(true);
+
+    progress_t *prog = calloc(1, sizeof(*prog));
+    pthread_mutex_init(&prog->mtx, NULL);
+    debate_arg_t *d = calloc(1, sizeof(*d));
+    d->idea = t;
+    d->model = xstrdup(g_cfg.selected_model);
+    d->session = s;
+    d->progress = prog->text;
+    d->prog_mtx = &prog->mtx;
+    g_debate_mode = true;
+    g_job_stop = 0;
+    job_start(&g_job, debate_worker, d);
+    run_job_ui();
+    job_join(&g_job);
+    g_debate_mode = false;
+
+    chat_save(&g_chat);
+    chat_rebuild_view(true);
+    pthread_mutex_destroy(&prog->mtx);
+    free(prog);
+    free(d->model);
+    free(d);
+}
+
+static void chat_sandbox_last(void) {
+    session_t *s = chat_current(&g_chat);
+    if (!s) return;
+    for (int i = s->n - 1; i >= 0; i--) {
+        if (strcmp(s->messages[i].role, "assistant")) continue;
+        const char *text = s->messages[i].content;
+        const char *open = strstr(text, "```");
+        while (open) {
+            const char *nl = strchr(open + 3, '\n');
+            const char *close;
+            if (nl) close = strstr(nl + 1, "```");
+            else close = NULL;
+            if (close) {
+                char *code = xstrndup(nl + 1, (size_t)(close - (nl + 1)));
+                sandbox_run(code);
+                free(code);
+                return;
+            }
+            open = nl ? strstr(nl + 1, "```") : NULL;
+        }
+    }
+    tui_alert("No runnable code block found in last assistant message.");
+}
+
+/* =================== multi-model dialog =================== */
+
+static void multi_model_dialog(void) {
+    if (g_nmodels == 0) {
+        tui_alert("Please fetch models first (Settings -> Fetch Models).");
+        return;
+    }
+    int h = LINES - 8, w = 56;
+    if (h > g_nmodels + 4) h = g_nmodels + 4;
+    int y0 = (LINES - h) / 2, x0 = (COLS - w) / 2;
+    WINDOW *win = tui_win(h, w, y0, x0);
+    WINDOW *list = tui_win(h - 4, w - 2, y0 + 2, x0 + 1);
+    tui_box(win, "Parallel Mode - Multi-Model Selection");
+
+    bool *checked = calloc((size_t)g_nmodels, sizeof(bool));
+    for (int i = 0; i < g_nmodels; i++)
+        for (int k = 0; k < g_nmulti; k++)
+            if (!strcmp(g_models[i], g_multi[k])) { checked[i] = true; break; }
+
+    int sel = 0;
+    bool done = false;
+    while (!done) {
+        werase(list);
+        int lh = getmaxy(list);
+        int top = sel - lh / 2;
+        if (top < 0) top = 0;
+        for (int i = 0; i < lh && top + i < g_nmodels; i++) {
+            int idx = top + i;
+            if (idx == sel) wattron(list, A_REVERSE);
+            mvwprintw(list, i, 0, "[%c] %s", checked[idx] ? 'X' : ' ', g_models[idx]);
+            if (idx == sel) wattroff(list, A_REVERSE);
+        }
+        wattrset(win, 0);
+        mvwprintw(win, h - 2, 2, "Space: toggle   Enter: run   [c]: clear   Esc: cancel");
+        wrefresh(list);
+        wrefresh(win);
+        int ch = getch();
+        if (ch == 27) done = true;
+        else if (ch == KEY_UP && sel > 0) sel--;
+        else if (ch == KEY_DOWN && sel < g_nmodels - 1) sel++;
+        else if (ch == ' ') checked[sel] = !checked[sel];
+        else if (ch == 'c' || ch == 'C') {
+            for (int i = 0; i < g_nmodels; i++) checked[i] = false;
+        } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+            multi_free();
+            for (int i = 0; i < g_nmodels; i++)
+                if (checked[i]) {
+                    g_multi = realloc(g_multi, sizeof(char *) * (size_t)(g_nmulti + 1));
+                    g_multi[g_nmulti++] = xstrdup(g_models[i]);
+                }
+            done = true;
+        }
+    }
+    delwin(list);
+    delwin(win);
+    free(checked);
+}
+
+/* =================== notes actions =================== */
+
+static void notes_rebuild_preview(void) {
+    mv_clear(&g_note_preview_view);
+    note_t *note = notes_current(&g_notes);
+    if (!note) return;
+    mv_add_md(&g_note_preview_view, note->content, false);
+    g_note_preview_view.top = g_note_preview_view.nrow;
+}
+
+static void notes_complement(void) {
+    note_t *note = notes_current(&g_notes);
+    if (!note) return;
+    if (!note->content[0]) {
+        tui_alert("Please write some text in the note first!");
+        return;
+    }
+    if (!config_has_key() || !g_cfg.selected_model[0]) {
+        tui_alert("Configure API key and model first.");
+        return;
+    }
+    complement_arg_t *a = calloc(1, sizeof(*a));
+    a->note = note;
+    a->model = xstrdup(g_cfg.selected_model);
+    g_job_stop = 0;
+    job_start(&g_job, complement_worker, a);
+    run_job_ui();
+    job_join(&g_job);
+    if (a->error) {
+        char *msg = xasprintf("AI Complement failed: %s", a->error);
+        tui_alert(msg);
+        free(msg);
+        free(a->error);
+    } else if (a->result) {
+        char *newc = xasprintf("%s\n\n%s", note->content, a->result);
+        char *title = xstrdup(note->title);
+        notes_set_current_fields(note, title, newc);
+        free(title);
+        free(newc);
+        notes_save(&g_notes);
+        free(a->result);
+        ed_set_text(&g_note_editor, note->content);
+    }
+    free(a->model);
+    free(a);
+}
+
+static void notes_export_md(void) {
+    char path[4096];
+    char *def = xasprintf("%s/%s.md", hub_dir(), notes_current(&g_notes)->title[0] ? notes_current(&g_notes)->title : "untitled");
+    if (!tui_prompt("Export note to (path)", def, path, sizeof(path))) { free(def); return; }
+    free(def);
+    note_t *note = notes_current(&g_notes);
+    if (notes_export_md_to(note, path)) tui_alert("Note exported.");
+    else tui_alert("Export failed.");
+}
+
+static void notes_import_md_ui(void) {
+    char path[4096];
+    if (!tui_pick_file("Import Markdown note", path, sizeof(path))) return;
+    notes_import_md(&g_notes, path);
+    notes_save(&g_notes);
+    ed_set_text(&g_note_editor, notes_current(&g_notes)->content);
+    tui_alert("Note imported.");
+}
+
+/* =================== IDE actions =================== */
+
+static void ide_editor_save(void) {
+    if (!g_ide_active[0]) return;
+    char *text = ed_get_text(&g_ide_editor);
+    ide_write_file(g_ide_active, text);
+    free(text);
+    g_ide_editor.dirty = 0;
+}
+
+static void ide_open_file(const char *path) {
+    char *content = ide_read_file(path);
+    if (!content) return;
+    ide_editor_save();
+    snprintf(g_ide_active, sizeof(g_ide_active), "%s", path);
+    bool found = false;
+    for (int i = 0; i < g_ide_nopen; i++)
+        if (!strcmp(g_ide_open[i], path)) { found = true; break; }
+    if (!found && g_ide_nopen < 64) g_ide_open[g_ide_nopen++] = xstrdup(path);
+    ed_set_text(&g_ide_editor, content);
+    free(content);
+    g_ide_editor.dirty = 0;
+}
+
+static void ide_close_file(int idx) {
+    if (idx < 0 || idx >= g_ide_nopen) return;
+    if (!strcmp(g_ide_open[idx], g_ide_active)) {
+        ide_editor_save();
+        g_ide_active[0] = '\0';
+        int next = idx > 0 ? idx - 1 : (g_ide_nopen > 1 ? 1 : -1);
+        if (next >= 0 && next < g_ide_nopen) {
+            snprintf(g_ide_active, sizeof(g_ide_active), "%s", g_ide_open[next]);
+        } else {
+            ed_set_text(&g_ide_editor, "");
+        }
+    }
+    free(g_ide_open[idx]);
+    for (int i = idx; i < g_ide_nopen - 1; i++) g_ide_open[i] = g_ide_open[i + 1];
+    g_ide_nopen--;
+    if (g_ide_active[0]) {
+        char *content = ide_read_file(g_ide_active);
+        if (content) {
+            ed_set_text(&g_ide_editor, content);
+            free(content);
+        }
+    }
+}
+
+static void ide_preview(void) {
+    /* combine html + css + js like the web PREVIEW module */
+    int n = 0;
+    char **files = ide_list_files(&n);
+    char *html = NULL;
+    char *mainhtml = NULL;
+    char *css = NULL;
+    char *js = NULL;
+    for (int i = 0; i < n; i++) {
+        if (str_has_suffix(files[i], ".html")) {
+            if (!html) html = files[i];
+            else if (strstr(files[i], "index")) { mainhtml = files[i]; html = mainhtml; }
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (str_has_suffix(files[i], ".css")) css = files[i];
+        if (str_has_suffix(files[i], ".js")) js = files[i];
+    }
+    sbuf_t page;
+    sbuf_init(&page);
+    if (html) {
+        char *c = ide_read_file(html);
+        if (c) { sbuf_append(&page, c); free(c); }
+    } else {
+        sbuf_append(&page, "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body></body></html>");
+    }
+    if (css) {
+        char *c = ide_read_file(css);
+        if (c) {
+            char *tag = xasprintf("\n<style>\n%s\n</style>", c);
+            char *page2 = xstrdup(page.s);
+            char *insert = strstr(page2, "</head>");
+            if (insert) {
+                sbuf_t b; sbuf_init(&b);
+                sbuf_append_n(&b, page2, (size_t)(insert - page2));
+                sbuf_append(&b, tag);
+                sbuf_append(&b, insert);
+                sbuf_free(&page);
+                page = b;
+            }
+            free(page2);
+            free(tag);
+            free(c);
+        }
+    }
+    if (js) {
+        char *c = ide_read_file(js);
+        if (c) {
+            char *tag = xasprintf("\n<script>\n%s\n</script>", c);
+            char *page2 = xstrdup(page.s);
+            char *insert = strstr(page2, "</body>");
+            if (insert) {
+                sbuf_t b; sbuf_init(&b);
+                sbuf_append_n(&b, page2, (size_t)(insert - page2));
+                sbuf_append(&b, tag);
+                sbuf_append(&b, insert);
+                sbuf_free(&page);
+                page = b;
+            }
+            free(page2);
+            free(tag);
+            free(c);
+        }
+    }
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/traliran-ide-preview-%d.html", (int)getpid());
+    write_file(path, page.s);
+    sbuf_free(&page);
+    ide_free_list(files, n);
+    open_in_browser(path);
+}
+
+static void ide_new_file_ui(void) {
+    char name[512];
+    if (!tui_prompt("New file name (e.g. script.js)", "", name, sizeof(name))) return;
+    char *t = str_dup_trim(name);
+    if (!t[0]) { free(t); return; }
+    if (ide_new_file(t)) {
+        ide_open_file(t);
+    } else {
+        tui_alert("Cannot create file (invalid or existing path).");
+    }
+    free(t);
+}
+
+static void ide_create_commit(void) {
+    char msg[512];
+    if (!tui_prompt("Commit message", "", msg, sizeof(msg))) return;
+    char *t = str_dup_trim(msg);
+    if (t[0]) vc_create_commit(t);
+    else vc_create_commit("Untitled commit");
+    free(t);
+    tui_alert("Commit created.");
+}
+
+/* agent actions */
+static void agent_send(void) {
+    char *text = str_dup_trim(g_agent_input.buf);
+    if (!text[0]) { free(text); return; }
+    if (!config_has_key()) {
+        free(text);
+        tui_alert("Configure API key first.");
+        return;
+    }
+    const char *model = g_cfg.selected_model;
+    if (!model[0]) {
+        free(text);
+        tui_alert("Select a model first (Settings).");
+        return;
+    }
+    in_set(&g_agent_input, "");
+    agent_arg_t *a = calloc(1, sizeof(*a));
+    a->model = xstrdup(model);
+    a->user_message = text;
+    a->chat = &g_agent_chat;
+    a->stop = &g_job_stop;
+    a->progress_ptr = &g_progress;
+    progress_set(&g_progress, "Thinking...");
+    g_job_stop = 0;
+    job_start(&g_job, agent_worker, a);
+    run_job_ui();
+    job_join(&g_job);
+    progress_set(&g_progress, "");
+    free(a->model);
+    free(a->user_message);
+    free(a);
+}
+
+/* =================== settings =================== */
+
+static void settings_edit_multiline(const char *title, char *dst, size_t dstsz) {
+    editor_t e;
+    ed_init(&e);
+    ed_set_text(&e, dst);
+    int h = LINES - 6, w = COLS - 8;
+    if (h < 5) h = 5;
+    int y0 = (LINES - h) / 2, x0 = (COLS - w) / 2;
+    WINDOW *win = tui_win(h, w, y0, x0);
+    WINDOW *editwin = tui_win(h - 3, w - 2, y0 + 2, x0 + 1);
+    tui_box(win, title);
+    bool done = false;
+    while (!done) {
+        mvwprintw(win, 1, 2, "F2: save   Esc: cancel");
+        ed_draw(&e, editwin);
+        wrefresh(editwin);
+        wrefresh(win);
+        int ch = tui_getkey();
+        if (ch == KEY_F(2)) done = true;
+        else if (ch == 27) break;
+        else ed_key(&e, ch);
+    }
+    if (done) {
+        char *text = ed_get_text(&e);
+        snprintf(dst, dstsz, "%s", text);
+        free(text);
+    }
+    delwin(editwin);
+    delwin(win);
+    ed_free(&e);
+}
+
+static void settings_select_provider(void) {
+    const provider_t **all = providers_all();
+    int count = 0;
+    while (all[count]) count++;
+    int h = count + 4, w = 60;
+    int y0 = (LINES - h) / 2, x0 = (COLS - w) / 2;
+    WINDOW *win = tui_win(h, w, y0, x0);
+    WINDOW *list = tui_win(count, w - 2, y0 + 2, x0 + 1);
+    tui_box(win, "Select AI Provider");
+    int sel = 0;
+    for (int i = 0; i < count; i++)
+        if (!strcmp(all[i]->id, g_cfg.provider)) sel = i;
+    bool done = false;
+    while (!done) {
+        werase(list);
+        for (int i = 0; i < count; i++) {
+            if (i == sel) wattron(list, A_REVERSE);
+            mvwprintw(list, i, 0, "%s   (%s)", all[i]->id, all[i]->url);
+            if (i == sel) wattroff(list, A_REVERSE);
+        }
+        wrefresh(list);
+        wrefresh(win);
+        int ch = getch();
+        if (ch == 27) done = true;
+        else if (ch == KEY_UP && sel > 0) sel--;
+        else if (ch == KEY_DOWN && sel < count - 1) sel++;
+        else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+            snprintf(g_cfg.provider, sizeof(g_cfg.provider), "%s", all[sel]->id);
+            if (!g_cfg.endpoint[0]) snprintf(g_cfg.endpoint, sizeof(g_cfg.endpoint), "%s", all[sel]->url);
+            config_save();
+            done = true;
+        }
+    }
+    delwin(list);
+    delwin(win);
+}
+
+static void settings_item(int idx, const char *label, const char *value, bool active) {
+    int x = 4;
+    if (active) wattron(w_main, A_REVERSE);
+    mvwprintw(w_main, idx + 1, 2, "%2d. %s", idx + 1, label);
+    wattrset(w_main, A_NORMAL);
+    int w = getmaxx(w_main);
+    if (active) wattron(w_main, A_BOLD);
+    mvwprintw(w_main, idx + 1, x + (int)strlen(label) + 4, "%.*s", w - x - (int)strlen(label) - 8, value ? value : "");
+    wattrset(w_main, A_NORMAL);
+}
+
+static void screen_settings_draw(void) {
+    const char *items[14];
+    char vals[14][2048];
+    items[0] = "Provider";
+    snprintf(vals[0], sizeof(vals[0]), "%s", g_cfg.provider);
+    items[1] = "API Key";
+    snprintf(vals[1], sizeof(vals[1]), "%s", g_cfg.api_key[0] ? "********" : "(missing)");
+    items[2] = "Endpoint";
+    snprintf(vals[2], sizeof(vals[2]), "%s", config_endpoint());
+    items[3] = "Bot Name";
+    snprintf(vals[3], sizeof(vals[3]), "%s", g_cfg.bot_name[0] ? g_cfg.bot_name : "(default: System AI)");
+    items[4] = "System Prompt";
+    snprintf(vals[4], sizeof(vals[4]), "%.40s", g_cfg.system_prompt[0] ? g_cfg.system_prompt : "(empty)");
+    items[5] = "Personal Info";
+    snprintf(vals[5], sizeof(vals[5]), "%.40s", g_cfg.personal_info[0] ? g_cfg.personal_info : "(empty)");
+    items[6] = "Temperature";
+    snprintf(vals[6], sizeof(vals[6]), "%.2f", g_cfg.temperature);
+    items[7] = "Top P";
+    snprintf(vals[7], sizeof(vals[7]), "%.2f", g_cfg.top_p);
+    items[8] = "Max Tokens";
+    snprintf(vals[8], sizeof(vals[8]), "%d", g_cfg.max_tokens);
+    items[9] = "Selected Model";
+    snprintf(vals[9], sizeof(vals[9]), "%s (%d available)", g_cfg.selected_model[0] ? g_cfg.selected_model : "(none)", g_nmodels);
+    items[10] = "Fetch Models";
+    vals[10][0] = '\0';
+    items[11] = "Export Config JSON";
+    vals[11][0] = '\0';
+    items[12] = "Import Config JSON";
+    vals[12][0] = '\0';
+    items[13] = "Reset Multi-Model Selection";
+    snprintf(vals[13], sizeof(vals[13]), g_nmulti > 0 ? "%d selected" : "(none)", 0);
+
+    werase(w_main);
+    mvwprintw(w_main, 0, 2, "Configuration (mirrors the web app settings)");
+    for (int i = 0; i < 14; i++) {
+        settings_item(i, items[i], vals[i], i == g_settings_sel);
+    }
+    mvwprintw(w_main, getmaxy(w_main) - 1, 2, "Up/Down: move   Enter: edit   F1: help   Esc: back");
+}
+
+static void screen_settings_key(int ch) {
+    if (ch == KEY_UP && g_settings_sel > 0) g_settings_sel--;
+    else if (ch == KEY_DOWN && g_settings_sel < 13) g_settings_sel++;
+    else if (ch == 27) g_screen = SCREEN_CHAT;
+    else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+        switch (g_settings_sel) {
+            case 0: settings_select_provider(); config_load(); fetch_models(); break;
+            case 1: {
+                char v[2048];
+                if (tui_prompt("API Key", g_cfg.api_key, v, sizeof(v))) {
+                    snprintf(g_cfg.api_key, sizeof(g_cfg.api_key), "%s", v);
+                    config_save();
+                }
+                break;
+            }
+            case 2: {
+                char v[1024];
+                if (tui_prompt("Endpoint (base URL)", g_cfg.endpoint, v, sizeof(v))) {
+                    snprintf(g_cfg.endpoint, sizeof(g_cfg.endpoint), "%s", str_trim(v));
+                    config_save();
+                }
+                break;
+            }
+            case 3: {
+                char v[256];
+                if (tui_prompt("Bot Name", g_cfg.bot_name, v, sizeof(v))) {
+                    snprintf(g_cfg.bot_name, sizeof(g_cfg.bot_name), "%s", str_trim(v));
+                    config_save();
+                }
+                break;
+            }
+            case 4: settings_edit_multiline("System Prompt", g_cfg.system_prompt, sizeof(g_cfg.system_prompt)); config_save(); break;
+            case 5: settings_edit_multiline("Personal Info", g_cfg.personal_info, sizeof(g_cfg.personal_info)); config_save(); break;
+            case 6: {
+                char v[64];
+                char *def = xasprintf("%.2f", g_cfg.temperature);
+                if (tui_prompt("Temperature", def, v, sizeof(v))) {
+                    g_cfg.temperature = atof(v);
+                    config_save();
+                }
+                free(def);
+                break;
+            }
+            case 7: {
+                char v[64];
+                char *def = xasprintf("%.2f", g_cfg.top_p);
+                if (tui_prompt("Top P", def, v, sizeof(v))) {
+                    g_cfg.top_p = atof(v);
+                    config_save();
+                }
+                free(def);
+                break;
+            }
+            case 8: {
+                char v[64];
+                char *def = xasprintf("%d", g_cfg.max_tokens);
+                if (tui_prompt("Max Tokens", def, v, sizeof(v))) {
+                    g_cfg.max_tokens = atoi(v);
+                    config_save();
+                }
+                free(def);
+                break;
+            }
+            case 9: {
+                if (g_nmodels == 0) tui_alert("No models. Fetch first.");
+                else {
+                    /* model picker */
+                    int h = LINES - 10, w = 64;
+                    if (h > g_nmodels + 4) h = g_nmodels + 4;
+                    int y0 = (LINES - h) / 2, x0 = (COLS - w) / 2;
+                    WINDOW *win = tui_win(h, w, y0, x0);
+                    WINDOW *list = tui_win(h - 4, w - 2, y0 + 2, x0 + 1);
+                    tui_box(win, "Select Model");
+                    int sel = 0;
+                    for (int i = 0; i < g_nmodels; i++)
+                        if (!strcmp(g_models[i], g_cfg.selected_model)) sel = i;
+                    bool dd = false;
+                    while (!dd) {
+                        werase(list);
+                        int lh = getmaxy(list);
+                        int top = sel - lh / 2;
+                        if (top < 0) top = 0;
+                        for (int i = 0; i < lh && top + i < g_nmodels; i++) {
+                            int idx = top + i;
+                            if (idx == sel) wattron(list, A_REVERSE);
+                            mvwprintw(list, i, 0, "%s", g_models[idx]);
+                            if (idx == sel) wattroff(list, A_REVERSE);
+                        }
+                        wrefresh(list);
+                        wrefresh(win);
+                        int c = getch();
+                        if (c == 27) dd = true;
+                        else if (c == KEY_UP && sel > 0) sel--;
+                        else if (c == KEY_DOWN && sel < g_nmodels - 1) sel++;
+                        else if (c == '\n' || c == '\r' || c == KEY_ENTER) {
+                            snprintf(g_cfg.selected_model, sizeof(g_cfg.selected_model), "%s", g_models[sel]);
+                            config_save();
+                            dd = true;
+                        }
+                    }
+                    delwin(list);
+                    delwin(win);
+                }
+                break;
+            }
+            case 10: fetch_models(); config_save(); break;
+            case 11: {
+                char path[4096];
+                char *def = xasprintf("%s/hub-config.json", hub_dir());
+                if (tui_prompt("Export config to", def, path, sizeof(path))) {
+                    cJSON *j = cJSON_CreateObject();
+                    cJSON_AddStringToObject(j, "provider", g_cfg.provider);
+                    cJSON_AddStringToObject(j, "apiKey", g_cfg.api_key);
+                    cJSON_AddStringToObject(j, "endpoint", g_cfg.endpoint);
+                    cJSON_AddStringToObject(j, "botName", g_cfg.bot_name);
+                    cJSON_AddStringToObject(j, "systemPrompt", g_cfg.system_prompt);
+                    cJSON_AddStringToObject(j, "personalInfo", g_cfg.personal_info);
+                    cJSON_AddStringToObject(j, "selectedModel", g_cfg.selected_model);
+                    cJSON_AddNumberToObject(j, "temperature", g_cfg.temperature);
+                    cJSON_AddNumberToObject(j, "topP", g_cfg.top_p);
+                    cJSON_AddNumberToObject(j, "maxTokens", g_cfg.max_tokens);
+                    char *json = cJSON_Print(j);
+                    write_file(path, json);
+                    free(json);
+                    cJSON_Delete(j);
+                    tui_alert("Config exported.");
+                }
+                free(def);
+                break;
+            }
+            case 12: {
+                char path[4096];
+                if (tui_pick_file("Import config JSON", path, sizeof(path))) {
+                    char *json = read_file(path);
+                    if (json) {
+                        cJSON *j = cJSON_Parse(json);
+                        if (j) {
+                            cJSON *v;
+                            if ((v = cJSON_GetObjectItem(j, "provider")) && cJSON_IsString(v)) snprintf(g_cfg.provider, sizeof(g_cfg.provider), "%s", v->valuestring);
+                            if ((v = cJSON_GetObjectItem(j, "apiKey")) && cJSON_IsString(v)) snprintf(g_cfg.api_key, sizeof(g_cfg.api_key), "%s", v->valuestring);
+                            if ((v = cJSON_GetObjectItem(j, "endpoint")) && cJSON_IsString(v)) snprintf(g_cfg.endpoint, sizeof(g_cfg.endpoint), "%s", v->valuestring);
+                            if ((v = cJSON_GetObjectItem(j, "botName")) && cJSON_IsString(v)) snprintf(g_cfg.bot_name, sizeof(g_cfg.bot_name), "%s", v->valuestring);
+                            if ((v = cJSON_GetObjectItem(j, "systemPrompt")) && cJSON_IsString(v)) snprintf(g_cfg.system_prompt, sizeof(g_cfg.system_prompt), "%s", v->valuestring);
+                            if ((v = cJSON_GetObjectItem(j, "personalInfo")) && cJSON_IsString(v)) snprintf(g_cfg.personal_info, sizeof(g_cfg.personal_info), "%s", v->valuestring);
+                            if ((v = cJSON_GetObjectItem(j, "selectedModel")) && cJSON_IsString(v)) snprintf(g_cfg.selected_model, sizeof(g_cfg.selected_model), "%s", v->valuestring);
+                            if ((v = cJSON_GetObjectItem(j, "temperature")) && cJSON_IsNumber(v)) g_cfg.temperature = v->valuedouble;
+                            if ((v = cJSON_GetObjectItem(j, "topP")) && cJSON_IsNumber(v)) g_cfg.top_p = v->valuedouble;
+                            if ((v = cJSON_GetObjectItem(j, "maxTokens")) && cJSON_IsNumber(v)) g_cfg.max_tokens = (int)v->valuedouble;
+                            cJSON_Delete(j);
+                            config_save();
+                            fetch_models();
+                            tui_alert("Configuration loaded!");
+                        } else {
+                            tui_alert("Invalid JSON structure.");
+                        }
+                        free(json);
+                    }
+                }
+                break;
+            }
+            case 13: multi_free(); break;
+        }
+    }
+}
+
+/* =================== help =================== */
+
+static void screen_help(void) {
+    int h = LINES - 4, w = COLS - 8;
+    if (h < 10) h = 10;
+    if (w < 40) w = 40;
+    int y0 = 2, x0 = 4;
+    WINDOW *win = tui_win(h, w, y0, x0);
+    tui_box(win, "Help");
+    const char *lines[] = {
+        "Global:",
+        "  [1..5]  switch screens (Chat, Notes, Store, IDE, Settings)",
+        "  [Tab]   cycle screens          [q] quit",
+        "  [F12]   toggle Vim mode (hjkl + i/Esc), [Esc] normal <- insert",
+        "  Plain hotkeys (q, ?, 1-5, Tab, x) need 3 presses within 1s (F-keys/Ctrl instant)",
+        "Chat:",
+        "  Enter send | Esc stop | F2 new | F3 rename | F4 delete",
+        "  F5 summarize | F6 regenerate | F7 multi-model | F8 debate | F9 sandbox | F10 attach",
+        "  Up/Down select session",
+        "Notes:",
+        "  F2 new | F3 delete | F4 AI complement | F5 export MD | F6 export RAG",
+        "  F7 import MD | F8 preview | F9 search | F10 title | Ctrl+Up/Down select note",
+        "IDE:",
+        "  F1 files | F2 versions | F3 bots | F4 new file | F6 preview | F7 export | F8 import",
+        "  F9 commit | F10 revert | Tab editor <-> agent input | PgUp/PgDn tabs | x delete file",
+        "  Space in agent input sends to AI coding agent.",
+        "Settings:",
+        "  Up/Down move | Enter edit | F1 help",
+        "",
+        "Press any key to close",
+    };
+    int n = (int)(sizeof(lines) / sizeof(lines[0]));
+    for (int i = 0; i < n; i++) {
+        int color = MD_DEFAULT;
+        if (str_has_prefix(lines[i], "Global") || str_has_prefix(lines[i], "Chat") ||
+            str_has_prefix(lines[i], "Notes") || str_has_prefix(lines[i], "IDE") ||
+            str_has_prefix(lines[i], "Settings"))
+            color = MD_HEADING;
+        int attr = color ? (attr_t)(COLOR_PAIR(color) | A_BOLD) : A_NORMAL;
+        wattron(win, attr);
+        mvwprintw(win, i + 1, 2, "%.*s", w - 4, lines[i]);
+        wattrset(win, A_NORMAL);
+    }
+    wrefresh(win);
+    getch();
+    delwin(win);
+}
+
+/* =================== screen drawing =================== */
+
+static void draw_tabbar(void) {
+    werase(w_tabbar);
+    const char *names[] = { "Chat", "Notes", "Store", "IDE", "Settings" };
+    int x = 1;
+    for (int i = 0; i < 5; i++) {
+        bool active = g_screen == (screen_t)i;
+        if (active) wattron(w_tabbar, COLOR_PAIR(MD_ACCENT) | A_BOLD);
+        mvwprintw(w_tabbar, 0, x, "[%d %s]", i + 1, names[i]);
+        if (active) wattroff(w_tabbar, COLOR_PAIR(MD_ACCENT) | A_BOLD);
+        x += (int)strlen(names[i]) + 6;
+    }
+    wattrset(w_tabbar, COLOR_PAIR(MD_DIM));
+    mvwprintw(w_tabbar, 0, COLS - 26, "[?] Help   [q] Quit");
+    wattrset(w_tabbar, A_NORMAL);
+    wrefresh(w_tabbar);
+}
+
+static void draw_status(void) {
+    werase(w_status);
+    char line[512];
+    const char *model = g_nmulti > 0 ? "[Multi]" : (g_cfg.selected_model[0] ? g_cfg.selected_model : "no model");
+    const char *vim = g_vim_mode ? (g_vim_insert ? "[VIM-INSERT]" : "[VIM]") : "";
+    if (g_streaming) {
+        snprintf(line, sizeof(line), " %s | %.90s | Streaming active | Tokens: %d (~%.4f USD) %s ",
+                 g_cfg.provider, model, g_last_tokens, g_last_cost, vim);
+    } else {
+        snprintf(line, sizeof(line), " %s | %.90s | Tokens: %d (~%.4f USD) %s ",
+                 g_cfg.provider, model, g_last_tokens, g_last_cost, vim);
+    }
+    wattrset(w_status, COLOR_PAIR(MD_DIM));
+    mvwprintw(w_status, 0, 0, "%.*s", COLS, line);
+    wattrset(w_status, A_NORMAL);
+    wrefresh(w_status);
+}
+
+static void screen_chat_draw(void) {
+    /* recreate windows */
+    int h = area_h();
+    int w = COLS;
+    int sidebar_w = 30;
+    if (sidebar_w > w / 3) sidebar_w = w / 3;
+
+    WINDOW *sessions = tui_win(h, sidebar_w, area_y(), 0);
+    WINDOW *msgs = tui_win(h - 3, w - sidebar_w, area_y(), sidebar_w);
+    WINDOW *inputwin = tui_win(3, w - sidebar_w, area_y() + h - 3, sidebar_w);
+
+    tui_box(sessions, "Sessions");
+    session_t *cur = chat_current(&g_chat);
+    int top = 0;
+    for (int i = 0; i < g_chat.n; i++) {
+        if (i >= top + h - 2) break;
+        char *nm = chat_session_name(g_chat.list[i]);
+        if (i == g_chat.current) wattron(sessions, COLOR_PAIR(MD_GREEN) | A_BOLD);
+        mvwprintw(sessions, i + 1 - top, 1, "%.*s", sidebar_w - 2, nm ? nm : "");
+        if (i == g_chat.current) wattroff(sessions, COLOR_PAIR(MD_GREEN) | A_BOLD);
+        free(nm);
+    }
+    wrefresh(sessions);
+
+    /* message view */
+    chat_rebuild_view(false);
+    mv_t view;
+    mv_init(&view);
+    view.rows = calloc((size_t)(g_chat_view.nrow ? g_chat_view.nrow : 1), sizeof(md_line_t));
+    for (int i = 0; i < g_chat_view.nrow; i++) {
+        view.rows[i].text = xstrdup(g_chat_view.rows[i].text);
+        view.rows[i].color = g_chat_view.rows[i].color;
+    }
+    view.nrow = g_chat_view.nrow;
+    view.top = g_chat_view.top;
+    view.caprow = g_chat_view.nrow;
+    if (g_active_stream) {
+        const char *bot = cur && cur->bot_name[0] ? cur->bot_name : "AI";
+        mv_add_sender(&view, bot, MD_ACCENT);
+        char *c = stream_snapshot_content(g_active_stream);
+        mv_add_md(&view, c, false);
+        free(c);
+    }
+    mv_draw(&view, msgs, 0, getmaxy(msgs));
+    for (int i = 0; i < view.nrow; i++) free(view.rows[i].text);
+    free(view.rows);
+    wrefresh(msgs);
+
+    /* input area */
+    werase(inputwin);
+    mvwprintw(inputwin, 0, 1, "Message:");
+    if (g_attach_content) {
+        wattrset(inputwin, COLOR_PAIR(MD_WARN));
+        mvwprintw(inputwin, 2, 1, "attached: %.30s [F10 to remove]", g_attach_name);
+        wattrset(inputwin, A_NORMAL);
+    }
+    WINDOW *inwin = tui_win(1, w - sidebar_w - 10, area_y() + h - 2, sidebar_w + 9);
+    in_draw(&g_chat_input, inwin, 0, 0, w - sidebar_w - 10);
+    wrefresh(inwin);
+    wrefresh(inputwin);
+    delwin(inwin);
+    delwin(sessions);
+    delwin(msgs);
+    delwin(inputwin);
+}
+
+static void screen_chat_key(int ch) {
+    switch (ch) {
+        case '\n': case '\r': case KEY_ENTER: chat_send(); break;
+        case KEY_F(2): chat_new_session(); break;
+        case KEY_F(3): {
+            session_t *s = chat_current(&g_chat);
+            char nm[256];
+            char *cur = chat_session_name(s);
+            if (tui_prompt("Rename session", cur, nm, sizeof(nm))) {
+                char *t = str_dup_trim(nm);
+                if (t[0]) { chat_rename(&g_chat, g_chat.current, t); chat_save(&g_chat); }
+                free(t);
+            }
+            free(cur);
+            break;
+        }
+        case KEY_F(4):
+            if (tui_confirm("Delete this session?")) {
+                chat_delete(&g_chat, g_chat.current);
+                chat_save(&g_chat);
+                g_view_msg_count = -1;
+            }
+            break;
+        case KEY_F(5): chat_summarize(); break;
+        case KEY_F(6): chat_regenerate(); break;
+        case KEY_F(7): multi_model_dialog(); break;
+        case KEY_F(8): chat_debate(); break;
+        case KEY_F(9): chat_sandbox_last(); break;
+        case KEY_F(10):
+            if (g_attach_content) {
+                free(g_attach_content);
+                g_attach_content = NULL;
+                g_attach_name[0] = '\0';
+            } else {
+                chat_attach();
+            }
+            break;
+        case KEY_UP:
+            if (g_chat.current > 0) {
+                g_chat.current--;
+                g_view_msg_count = -1;
+            }
+            break;
+        case KEY_DOWN:
+            if (g_chat.current < g_chat.n - 1) {
+                g_chat.current++;
+                g_view_msg_count = -1;
+            }
+            break;
+        default:
+            in_key(&g_chat_input, ch);
+            break;
+    }
+}
+
+static void screen_notes_draw(void) {
+    int h = area_h();
+    int w = COLS;
+    int list_w = 30;
+    if (list_w > w / 3) list_w = w / 3;
+
+    WINDOW *listwin = tui_win(h, list_w, area_y(), 0);
+    WINDOW *titlewin = tui_win(1, w - list_w, area_y(), list_w);
+    WINDOW *edwin = tui_win(h - 2, w - list_w, area_y() + 1, list_w);
+    WINDOW *tagwin = tui_win(1, w - list_w, area_y() + h - 1, list_w);
+
+    tui_box(listwin, "Notes");
+    /* filter */
+    int shown = 0;
+    for (int i = 0; i < g_notes.n; i++) {
+        note_t *n = g_notes.list[i];
+        bool match = true;
+        if (g_notes.search[0]) {
+            match = strstr(n->title, g_notes.search) || strstr(n->content, g_notes.search);
+        }
+        if (!match) continue;
+        if (shown >= h - 2) break;
+        if (i == g_notes.current) wattron(listwin, COLOR_PAIR(MD_GREEN) | A_BOLD);
+        mvwprintw(listwin, shown + 1, 1, "%.*s", list_w - 2, n->title[0] ? n->title : "(untitled)");
+        wattrset(listwin, A_NORMAL);
+        char snippet[128];
+        snprintf(snippet, sizeof(snippet), "%.40s", n->content[0] ? n->content : "");
+        for (size_t k = 0; k < strlen(snippet); k++) if (snippet[k] == '\n') snippet[k] = ' ';
+        mvwprintw(listwin, shown + 1, 1, "%.*s", list_w - 2, "");
+        if (i == g_notes.current) wattroff(listwin, COLOR_PAIR(MD_GREEN) | A_BOLD);
+        char *ts = format_ts(n->updated_at);
+        mvwprintw(listwin, shown + 1, list_w - 8, "%.6s", ts);
+        free(ts);
+        shown++;
+    }
+    mvwprintw(listwin, h - 1, 1, "search: %s", g_notes.search[0] ? g_notes.search : "(none)");
+    wrefresh(listwin);
+
+    note_t *note = notes_current(&g_notes);
+    werase(titlewin);
+    if (note) {
+        wattrset(titlewin, COLOR_PAIR(MD_HEADING) | A_BOLD);
+        mvwprintw(titlewin, 0, 1, "%s", note->title[0] ? note->title : "(untitled)");
+        wattrset(titlewin, A_NORMAL);
+    }
+    wrefresh(titlewin);
+
+    if (g_note_preview) {
+        notes_rebuild_preview();
+        mv_draw(&g_note_preview_view, edwin, 0, getmaxy(edwin));
+    } else {
+        ed_draw(&g_note_editor, edwin);
+    }
+    wrefresh(edwin);
+
+    werase(tagwin);
+    if (note) {
+        int x = 1;
+        for (int i = 0; i < note->ntags && x < w - list_w - 4; i++) {
+            wattrset(tagwin, COLOR_PAIR(MD_GREEN));
+            mvwprintw(tagwin, 0, x, "#%s", note->tags[i]);
+            wattrset(tagwin, A_NORMAL);
+            x += (int)strlen(note->tags[i]) + 2;
+        }
+    }
+    wrefresh(tagwin);
+
+    delwin(listwin);
+    delwin(titlewin);
+    delwin(edwin);
+    delwin(tagwin);
+}
+
+static void screen_notes_key(int ch) {
+    note_t *note = notes_current(&g_notes);
+    switch (ch) {
+        case KEY_F(2): notes_new(&g_notes); notes_save(&g_notes); ed_set_text(&g_note_editor, ""); break;
+        case KEY_F(3):
+            if (tui_confirm("Delete this note?")) {
+                notes_delete(&g_notes, g_notes.current);
+                notes_save(&g_notes);
+                note = notes_current(&g_notes);
+                ed_set_text(&g_note_editor, note->content);
+            }
+            break;
+        case KEY_F(4): notes_complement(); break;
+        case KEY_F(5): notes_export_md(); break;
+        case KEY_F(6):
+            if (notes_export_rag(&g_notes)) tui_alert("Note added to RAG knowledge base.");
+            else tui_alert("Note is empty - nothing to export.");
+            break;
+        case KEY_F(7): notes_import_md_ui(); break;
+        case KEY_F(8): g_note_preview = !g_note_preview; notes_rebuild_preview(); break;
+        case KEY_F(9): {
+            char q[256];
+            if (tui_prompt("Search notes (empty = clear)", g_notes.search, q, sizeof(q))) {
+                snprintf(g_notes.search, sizeof(g_notes.search), "%s", q);
+            }
+            break;
+        }
+        case KEY_F(10): {
+            char t[512];
+            if (note && tui_prompt("Note title", note->title, t, sizeof(t))) {
+                char *content = xstrdup(note->content);
+                notes_set_current_fields(note, t, content);
+                free(content);
+                notes_save(&g_notes);
+            }
+            break;
+        }
+        case KEY_CTRL('p'): case KEY_CTRL('n'):
+            /* next */
+            if (g_notes.current < g_notes.n - 1) {
+                g_notes.current++;
+                note = notes_current(&g_notes);
+                ed_set_text(&g_note_editor, note->content);
+            }
+            break;
+        default:
+            if (ed_key(&g_note_editor, ch)) {
+                note = notes_current(&g_notes);
+                if (note) {
+                    char *text = ed_get_text(&g_note_editor);
+                    char *title = xstrdup(note->title);
+                    notes_set_current_fields(note, title, text);
+                    free(title);
+                    free(text);
+                    notes_save(&g_notes);
+                }
+            }
+            break;
+    }
+}
+
+static void screen_store_draw(void) {
+    int h = area_h();
+    int w = COLS;
+    int list_w = 40;
+    if (list_w > w / 2) list_w = w / 2;
+    WINDOW *listwin = tui_win(h, list_w, area_y(), 0);
+    WINDOW *infowin = tui_win(h, w - list_w, area_y(), list_w);
+
+    tui_box(listwin, "Assistant Store");
+    int total = g_store.nfree + g_store.npaid;
+    int sel = g_store_sel;
+    int shown = 0;
+    for (int i = 0; i < g_store.nfree; i++) {
+        if (shown >= h - 2) break;
+        if (sel == i) wattron(listwin, A_REVERSE);
+        mvwprintw(listwin, shown + 1, 1, "FREE  %s", g_store.free[i]->name);
+        if (sel == i) wattroff(listwin, A_REVERSE);
+        shown++;
+    }
+    for (int i = 0; i < g_store.npaid; i++) {
+        if (shown >= h - 2) break;
+        int idx = g_store.nfree + i;
+        if (sel == idx) wattron(listwin, A_REVERSE);
+        wattrset(listwin, COLOR_PAIR(MD_AMBER));
+        mvwprintw(listwin, shown + 1, 1, "PAID  %s", g_store.paid[i]->name);
+        if (sel == idx) wattron(listwin, A_REVERSE);
+        wattrset(listwin, A_NORMAL);
+        if (sel == idx) wattroff(listwin, A_REVERSE);
+        shown++;
+    }
+    wrefresh(listwin);
+
+    werase(infowin);
+    mvwprintw(infowin, 0, 1, "Use Up/Down to browse, Enter to install");
+    const char *name = NULL, *desc = NULL, *link = NULL, *prompt = NULL;
+    if (sel < g_store.nfree) {
+        name = g_store.free[sel]->name;
+        desc = g_store.free[sel]->description;
+        prompt = g_store.free[sel]->prompt;
+    } else {
+        int pi = sel - g_store.nfree;
+        if (pi < g_store.npaid) {
+            name = g_store.paid[pi]->name;
+            desc = g_store.paid[pi]->description;
+            link = g_store.paid[pi]->link;
+        }
+    }
+    (void)total;
+    if (name) {
+        wattrset(infowin, COLOR_PAIR(MD_HEADING) | A_BOLD);
+        mvwprintw(infowin, 2, 2, "%s", name);
+        wattrset(infowin, A_NORMAL);
+        /* wrap description */
+        int x = 2, y = 4;
+        for (const char *p = desc; *p; p++) {
+            if (x >= w - list_w - 4) { x = 2; y++; }
+            if (y >= h - 2) break;
+            mvwaddch(infowin, y, x++, *p);
+        }
+        y += 2;
+        if (prompt) {
+            wattrset(infowin, COLOR_PAIR(MD_DIM));
+            mvwprintw(infowin, y, 2, "Prompt:");
+            wattrset(infowin, A_NORMAL);
+            y++;
+            x = 2;
+            for (const char *p = prompt; *p; p++) {
+                if (x >= w - list_w - 4) { x = 2; y++; }
+                if (y >= h - 2) break;
+                mvwaddch(infowin, y, x++, *p);
+            }
+        }
+        if (link) {
+            wattrset(infowin, COLOR_PAIR(MD_AMBER));
+            mvwprintw(infowin, h - 3, 2, "Link: %s", link);
+            wattrset(infowin, A_NORMAL);
+            mvwprintw(infowin, h - 2, 2, "[o] open in browser   [Enter] install (free only)");
+        } else {
+            mvwprintw(infowin, h - 2, 2, "[Enter] install this free assistant");
+        }
+    }
+    wrefresh(infowin);
+
+    delwin(listwin);
+    delwin(infowin);
+}
+
+static void screen_store_key(int ch) {
+    int total = g_store.nfree + g_store.npaid;
+    if (ch == KEY_UP && g_store_sel > 0) g_store_sel--;
+    else if (ch == KEY_DOWN && g_store_sel < total - 1) g_store_sel++;
+    else if ((ch == '\n' || ch == '\r' || ch == KEY_ENTER) && g_store_sel < g_store.nfree) {
+        store_item_t *item = g_store.free[g_store_sel];
+        snprintf(g_cfg.bot_name, sizeof(g_cfg.bot_name), "%s", item->name);
+        snprintf(g_cfg.system_prompt, sizeof(g_cfg.system_prompt), "%s", item->prompt);
+        config_save();
+        chat_new_session();
+        g_view_msg_count = -1;
+        g_screen = SCREEN_CHAT;
+        char *msg = xasprintf("Assistant Profile \"%s\" is now online!", item->name);
+        tui_alert(msg);
+        free(msg);
+    } else if (ch == 'o' || ch == 'O') {
+        if (g_store_sel >= g_store.nfree) {
+            int pi = g_store_sel - g_store.nfree;
+            if (pi < g_store.npaid) open_in_browser(g_store.paid[pi]->link);
+        }
+    }
+}
+
+static void screen_ide_draw(void) {
+    int h = area_h();
+    int w = COLS;
+    int left_w = 30, right_w = 42;
+    if (left_w > w / 4) left_w = w / 4;
+    if (right_w > w / 3) right_w = w / 3;
+
+    WINDOW *leftwin = tui_win(h, left_w, area_y(), 0);
+    WINDOW *tabsbar = tui_win(1, w - left_w - right_w, area_y(), left_w);
+    WINDOW *edwin = tui_win(h - 1, w - left_w - right_w, area_y() + 1, left_w);
+    WINDOW *rightwin = tui_win(h, right_w, area_y(), w - right_w);
+    WINDOW *agentin = tui_win(1, right_w - 2, area_y() + h - 1, w - right_w + 1);
+
+    /* left panel with tabs */
+    tui_box(leftwin, "IDE");
+    const char *ltabs[3] = { "Files", "Versions", "Bots" };
+    for (int i = 0; i < 3; i++) {
+        int x = 1 + i * 9;
+        if (i == g_ide_left_tab) wattron(leftwin, COLOR_PAIR(MD_ACCENT) | A_BOLD);
+        mvwprintw(leftwin, 1, x, "F%d %s", i + 1, ltabs[i]);
+        if (i == g_ide_left_tab) wattroff(leftwin, COLOR_PAIR(MD_ACCENT) | A_BOLD);
+    }
+
+    if (g_ide_left_tab == 0) {
+        int n = 0;
+        char **files = ide_list_files(&n);
+        for (int i = 0; i < n && i < h - 5; i++) {
+            bool active = !strcmp(files[i], g_ide_active);
+            if (active) wattron(leftwin, COLOR_PAIR(MD_GREEN) | A_BOLD);
+            mvwprintw(leftwin, i + 3, 1, "%.*s", left_w - 2, files[i]);
+            if (active) wattroff(leftwin, COLOR_PAIR(MD_GREEN) | A_BOLD);
+        }
+        ide_free_list(files, n);
+        mvwprintw(leftwin, h - 1, 1, "x: delete active file");
+    } else if (g_ide_left_tab == 1) {
+        mvwprintw(leftwin, 3, 1, "[F9] new commit   [F10] revert");
+        int cnt = vc_count();
+        for (int i = 0; i < cnt && i < h - 6; i++) {
+            char *s = vc_summary(i);
+            mvwprintw(leftwin, i + 4, 1, "%.*s", left_w - 2, s ? s : "");
+            free(s);
+        }
+        if (cnt == 0) mvwprintw(leftwin, 4, 1, "No commits yet.");
+    } else {
+        mvwprintw(leftwin, 3, 1, "Custom assistants:");
+        int cnt = ide_bots_count();
+        for (int i = 0; i < cnt && i < h - 8; i++) {
+            ide_bot_t *b = ide_bots_get(i);
+            bool active = ide_bots_active() == b;
+            if (active) wattron(leftwin, COLOR_PAIR(MD_GREEN) | A_BOLD);
+            mvwprintw(leftwin, i + 4, 1, "%.*s", left_w - 2, b->name);
+            if (active) wattroff(leftwin, COLOR_PAIR(MD_GREEN) | A_BOLD);
+        }
+        mvwprintw(leftwin, h - 4, 1, "[n] new bot   [e] edit   [u] use");
+        mvwprintw(leftwin, h - 3, 1, "[x] delete   [o] export   [i] import");
+    }
+    wrefresh(leftwin);
+
+    /* open file tabs */
+    werase(tabsbar);
+    int x = 1;
+    for (int i = 0; i < g_ide_nopen; i++) {
+        const char *base = strrchr(g_ide_open[i], '/');
+        base = base ? base + 1 : g_ide_open[i];
+        bool active = !strcmp(g_ide_open[i], g_ide_active);
+        if (active) wattron(tabsbar, COLOR_PAIR(MD_ACCENT) | A_BOLD);
+        mvwprintw(tabsbar, 0, x, "%s%s%s", active ? "[" : " ", base, active ? "]" : " ");
+        if (active) wattroff(tabsbar, COLOR_PAIR(MD_ACCENT) | A_BOLD);
+        x += (int)strlen(base) + 3;
+    }
+    wrefresh(tabsbar);
+
+    ed_draw(&g_ide_editor, edwin);
+    wrefresh(edwin);
+
+    /* right panel: agent chat */
+    tui_box(rightwin, "AI Agent");
+    char *snap = agent_chat_snapshot(&g_agent_chat);
+    mv_clear(&g_agent_view);
+    mv_add_md(&g_agent_view, snap, false);
+    free(snap);
+    if (g_job.done == 0) {
+        char *p = xstrdup(g_progress.text);
+        mv_add_plain(&g_agent_view, p, MD_WARN);
+        free(p);
+    }
+    mv_draw(&g_agent_view, rightwin, 1, getmaxy(rightwin) - 2);
+    wrefresh(rightwin);
+
+    in_draw(&g_agent_input, agentin, 0, 0, right_w - 2);
+    wrefresh(agentin);
+
+    delwin(leftwin);
+    delwin(tabsbar);
+    delwin(edwin);
+    delwin(rightwin);
+    delwin(agentin);
+}
+
+/* Triple-press gate: plain-character program hotkeys (q, ?, Tab, 1-5, x)
+   only fire after 3 consecutive presses of the same key within 1 second,
+   so they never interfere with typing. F-keys and Ctrl combos are exempt. */
+static int g_gate_key;
+static long long g_gate_ts;
+static int g_gate_count;
+
+static bool hotkey_gate(int ch) {
+    long long now = now_ms();
+    if (ch == g_gate_key && now - g_gate_ts <= 1000) {
+        g_gate_count++;
+    } else {
+        g_gate_key = ch;
+        g_gate_count = 1;
+    }
+    g_gate_ts = now;
+    return g_gate_count >= 3;
+}
+
+static void screen_ide_key(int ch) {
+    /* focus: 0 editor, 1 agent input */
+    if (g_ide_focus == 1) {
+        if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) { agent_send(); return; }
+        if (ch == 27 || ch == '\t') { g_ide_focus = 0; return; }
+        in_key(&g_agent_input, ch);
+        return;
+    }
+
+    switch (ch) {
+        case '\t': g_ide_focus = 1; break;
+        case KEY_F(1): g_ide_left_tab = 0; break;
+        case KEY_F(2): g_ide_left_tab = 1; break;
+        case KEY_F(3): g_ide_left_tab = 2; break;
+        case KEY_F(4): ide_new_file_ui(); break;
+        case KEY_F(6): ide_preview(); break;
+        case KEY_F(7): {
+            char path[4096];
+            char *def = xasprintf("%s/workspace-export-%lld.tar.gz", hub_dir(), (long long)now_ms());
+            if (tui_prompt("Export project to", def, path, sizeof(path))) {
+                if (ide_export_project(path)) tui_alert("Project exported.");
+                else tui_alert("Export failed.");
+            }
+            free(def);
+            break;
+        }
+        case KEY_F(8): {
+            char path[4096];
+            if (tui_pick_file("Import project archive", path, sizeof(path))) {
+                if (ide_import_project(path)) {
+                    ide_open_file(g_ide_active);
+                    tui_alert("Project imported.");
+                } else tui_alert("Import failed.");
+            }
+            break;
+        }
+        case KEY_F(9): ide_create_commit(); break;
+        case KEY_F(10): {
+            char id[128];
+            snprintf(id, sizeof(id), "%s", vc_count() > 0 ? vc_id(0) : "");
+            if (tui_prompt("Revert to commit id", id, id, sizeof(id))) {
+                if (vc_revert_to(str_trim(id))) {
+                    ide_open_file(g_ide_active);
+                    tui_alert("Workspace reverted.");
+                } else tui_alert("Commit not found.");
+            }
+            break;
+        }
+        case KEY_NPAGE:
+            for (int i = 0; i < g_ide_nopen; i++)
+                if (!strcmp(g_ide_open[i], g_ide_active)) {
+                    int next = (i + 1) % g_ide_nopen;
+                    ide_open_file(g_ide_open[next]);
+                    break;
+                }
+            break;
+        case KEY_PPAGE:
+            for (int i = 0; i < g_ide_nopen; i++)
+                if (!strcmp(g_ide_open[i], g_ide_active)) {
+                    int prev = i > 0 ? i - 1 : g_ide_nopen - 1;
+                    ide_open_file(g_ide_open[prev]);
+                    break;
+                }
+            break;
+        case 'x': case 'X': {
+            if (g_ide_active[0] && hotkey_gate(ch)) {
+                char *msg = xasprintf("Delete %s?", g_ide_active);
+                if (tui_confirm(msg)) {
+                    if (!ide_delete_file(g_ide_active)) ide_delete_folder(g_ide_active);
+                    ide_close_file(-1);
+                    for (int i = 0; i < g_ide_nopen; i++)
+                        if (!strcmp(g_ide_open[i], g_ide_active)) ide_close_file(i);
+                    g_ide_active[0] = '\0';
+                }
+                free(msg);
+            }
+            break;
+        }
+        case KEY_F(5): ide_editor_save(); break;
+        default:
+            /* left panel quick actions when tab == 2 (bots) */
+            if (g_ide_left_tab == 2) {
+                if (ch == 'n') {
+                    char name[256], prompt[4096];
+                    if (tui_prompt("Bot name", "", name, sizeof(name))) {
+                        char *t = str_dup_trim(name);
+                        if (t[0]) {
+                            prompt[0] = '\0';
+                            settings_edit_multiline("Bot system prompt", prompt, sizeof(prompt));
+                            ide_bot_t bot = {0};
+                            bot.name = t;
+                            bot.prompt = prompt;
+                            bot.model = g_cfg.selected_model;
+                            bot.temp = 0.7;
+                            ide_bot_save(&bot);
+                            free(t);
+                        }
+                    }
+                } else if (ch == 'e') {
+                    int sel = 0;
+                    (void)sel;
+                    char n2[256];
+                    if (tui_prompt("Edit bot (index) or name", "", n2, sizeof(n2))) {
+                        int idx = atoi(str_trim(n2)) - 1;
+                        if (idx >= 0 && idx < ide_bots_count()) {
+                            ide_bot_t *b = ide_bots_get(idx);
+                            char nn[256], pp[4096];
+                            snprintf(nn, sizeof(nn), "%s", b->name);
+                            if (tui_prompt("Bot name", nn, nn, sizeof(nn))) {
+                                snprintf(pp, sizeof(pp), "%s", b->prompt);
+                                settings_edit_multiline("Bot system prompt", pp, sizeof(pp));
+                                b->name = xstrdup(nn);
+                                b->prompt = xstrdup(pp);
+                                ide_bot_save(b);
+                            }
+                        }
+                    }
+                } else if (ch == 'u') {
+                    char n3[256];
+                    if (tui_prompt("Use bot index", "", n3, sizeof(n3))) {
+                        int idx = atoi(str_trim(n3)) - 1;
+                        ide_bot_set_active(idx);
+                    }
+                } else if (ch == 'x') {
+                    char n4[256];
+                    if (tui_prompt("Delete bot index", "", n4, sizeof(n4))) {
+                        int idx = atoi(str_trim(n4)) - 1;
+                        ide_bot_delete(idx);
+                    }
+                } else if (ch == 'o') {
+                    char *json = ide_bots_export_json();
+                    char path[4096];
+                    char *def = xasprintf("%s/traliran-ide-bots.json", hub_dir());
+                    if (tui_prompt("Export bots to", def, path, sizeof(path))) {
+                        write_file(path, json);
+                        tui_alert("Bots exported.");
+                    }
+                    free(def);
+                    free(json);
+                } else if (ch == 'i') {
+                    char path[4096];
+                    if (tui_pick_file("Import bots JSON", path, sizeof(path))) {
+                        char *json = read_file(path);
+                        if (json) {
+                            if (ide_bots_import_json(json)) tui_alert("Bots imported.");
+                            else tui_alert("Invalid format.");
+                            free(json);
+                        }
+                    }
+                }
+                return;
+            }
+            /* file selection when tab == 0 */
+            if (g_ide_left_tab == 0 && (ch == KEY_UP || ch == KEY_DOWN || ch == '\n' || ch == '\r' || ch == KEY_ENTER)) {
+                int n = 0;
+                char **files = ide_list_files(&n);
+                static int fsel = 0;
+                if (ch == KEY_UP && fsel > 0) fsel--;
+                else if (ch == KEY_DOWN && fsel < n - 1) fsel++;
+                else if ((ch == '\n' || ch == '\r' || ch == KEY_ENTER) && n > 0) {
+                    ide_open_file(files[fsel]);
+                }
+                ide_free_list(files, n);
+                return;
+            }
+            if (ed_key(&g_ide_editor, ch)) {
+                g_ide_editor.dirty = 1;
+                if (g_ide_active[0]) {
+                    char *text = ed_get_text(&g_ide_editor);
+                    ide_write_file(g_ide_active, text);
+                    free(text);
+                }
+            }
+            break;
+    }
+}
+
+/* =================== main loop =================== */
+
+void draw_all(void) {
+    draw_tabbar();
+    draw_status();
+    if (!w_main) w_main = tui_win(area_h(), COLS, area_y(), 0);
+    werase(w_main);
+    wrefresh(w_main);   /* always paint the main region first so nothing shows through */
+    switch (g_screen) {
+        case SCREEN_CHAT:    screen_chat_draw(); break;
+        case SCREEN_NOTES:   screen_notes_draw(); break;
+        case SCREEN_STORE:   screen_store_draw(); break;
+        case SCREEN_IDE:     screen_ide_draw(); break;
+        case SCREEN_SETTINGS: screen_settings_draw(); wrefresh(w_main); break;
+        default: break;
+    }
+}
+
+static void handle_key(int ch) {
+    /* vim mode toggle */
+    if (ch == KEY_F(12)) {
+        g_vim_mode = !g_vim_mode;
+        g_vim_insert = false;
+        storage_set("gem_vim_mode", g_vim_mode ? "1" : "0");
+        storage_save();
+        return;
+    }
+    /* vim-like navigation */
+    if (g_vim_mode) {
+        if (g_vim_insert) {
+            /* insert mode: keys pass through, Esc returns to normal mode */
+            if (ch == 27) { g_vim_insert = false; return; }
+        } else {
+            /* normal mode: hjkl navigate, i/a enter insert */
+            switch (ch) {
+                case 'j': ch = KEY_DOWN; break;
+                case 'k': ch = KEY_UP; break;
+                case 'h': ch = KEY_LEFT; break;
+                case 'l': ch = KEY_RIGHT; break;
+                case 'i': case 'a':
+                    g_vim_insert = true;
+                    return;
+                case 27:
+                    return; /* already in normal mode */
+                default:
+                    break;
+            }
+        }
+    }
+    if (ch == 'q' || ch == 'Q') {
+        if (hotkey_gate(ch)) {
+            if (tui_confirm("Quit?")) {
+                storage_save();
+                app_quit = 1;
+            }
+            return;
+        }
+    } else if (ch == '?') {
+        if (hotkey_gate(ch)) {
+            screen_help();
+            return;
+        }
+    } else if (ch == '\t') {
+        if (hotkey_gate(ch)) {
+            g_screen = (screen_t)((g_screen + 1) % 5);
+            return;
+        }
+    } else if (ch >= '1' && ch <= '5') {
+        if (hotkey_gate(ch)) {
+            g_screen = (screen_t)(ch - '1');
+            fprintf(stderr, "[DBG] switch to %d\n", g_screen);
+            return;
+        }
+    } else if (ch == KEY_CTRL('1')) { g_screen = SCREEN_CHAT; return; }
+    else if (ch == KEY_CTRL('2')) { g_screen = SCREEN_NOTES; return; }
+    else if (ch == KEY_CTRL('3')) { g_screen = SCREEN_STORE; return; }
+    else if (ch == KEY_CTRL('4')) { g_screen = SCREEN_IDE; return; }
+    else if (ch == KEY_CTRL('5')) { g_screen = SCREEN_SETTINGS; return; }
+
+    switch (g_screen) {
+        case SCREEN_CHAT: screen_chat_key(ch); break;
+        case SCREEN_NOTES: screen_notes_key(ch); break;
+        case SCREEN_STORE: screen_store_key(ch); break;
+        case SCREEN_IDE: screen_ide_key(ch); break;
+        case SCREEN_SETTINGS: screen_settings_key(ch); break;
+        default: break;
+    }
+}
+
+void app_run(void) {
+    /* state init */
+    storage_init();
+    config_load();
+    g_vim_mode = !strcmp(storage_get("gem_vim_mode"), "1");
+    chat_load(&g_chat);
+    notes_load(&g_notes);
+    store_init(&g_store);
+    ide_init();
+    ide_bots_reload();
+    vc_load();
+    agent_chat_init(&g_agent_chat);
+    mv_init(&g_agent_view);
+    mv_init(&g_chat_view);
+    mv_init(&g_note_preview_view);
+    progress_t prog = {0};
+    pthread_mutex_init(&prog.mtx, NULL);
+    g_progress = prog;
+
+    in_init(&g_chat_input);
+    in_init(&g_note_title);
+    in_init(&g_agent_input);
+    ed_init(&g_note_editor);
+    ed_init(&g_ide_editor);
+
+    fetch_models();
+
+    session_t *s = chat_current(&g_chat);
+    note_t *n = notes_current(&g_notes);
+    if (s) {
+        g_view_msg_count = -1;
+    }
+    if (n) ed_set_text(&g_note_editor, n->content);
+
+    w_tabbar = tui_win(TAB_H, COLS, 0, 0);
+    w_status = tui_win(STATUS_H, COLS, LINES - STATUS_H, 0);
+    w_main = tui_win(area_h(), COLS, area_y(), 0);
+
+    while (!app_quit) {
+        draw_all();
+        if (g_screen == SCREEN_CHAT && !g_job.done) {
+            /* handled in run_job_ui */
+        }
+        int ch = tui_getkey();
+        if (ch == KEY_RESIZE) {
+            /* recreate windows */
+            if (w_tabbar) delwin(w_tabbar);
+            if (w_status) delwin(w_status);
+            if (w_main) delwin(w_main);
+            w_tabbar = tui_win(TAB_H, COLS, 0, 0);
+            w_status = tui_win(STATUS_H, COLS, LINES - STATUS_H, 0);
+            w_main = tui_win(area_h(), COLS, area_y(), 0);
+            continue;
+        }
+        handle_key(ch);
+    }
+
+    /* cleanup */
+    ide_editor_save();
+    storage_save();
+    delwin(w_tabbar);
+    delwin(w_status);
+    delwin(w_main);
+}
