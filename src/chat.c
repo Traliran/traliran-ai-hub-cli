@@ -421,14 +421,27 @@ static char *merge_native_call(const char *content, char *ntc) {
     return ntc;
 }
 
-static int api_complete_impl(const char *model, const char *messages_json,
-                             const char *tools_json,
-                             double temperature, double top_p, int max_tokens,
-                             api_result_t *out) {
+static int api_complete_impl_for(const char *provider_id,
+                                   const char *model, const char *messages_json,
+                                   const char *tools_json,
+                                   double temperature, double top_p, int max_tokens,
+                                   api_result_t *out) {
     memset(out, 0, sizeof(*out));
-    const provider_t *pr = providers_get(g_cfg.provider);
-    const char *ep = config_endpoint();
-    const char *key = g_cfg.api_key;
+    const char *pid = provider_id && provider_id[0] ? provider_id : g_cfg.provider;
+    const provider_t *pr = providers_get(pid);
+    char ep_buf[2048];
+    char key_buf[2048];
+    const char *ep;
+    const char *key;
+    if (provider_id && provider_id[0]) {
+        config_get_endpoint_for(pid, ep_buf, sizeof(ep_buf));
+        config_get_key_for(pid, key_buf, sizeof(key_buf));
+        ep = ep_buf;
+        key = key_buf;
+    } else {
+        ep = config_endpoint();
+        key = g_cfg.api_key;
+    }
 
     if (!strcmp(pr->type, "anthropic")) {
         /* convert to anthropic /messages payload */
@@ -567,16 +580,36 @@ static int api_complete_impl(const char *model, const char *messages_json,
     return 0;
 }
 
+static int api_complete_impl(const char *model, const char *messages_json,
+                             const char *tools_json,
+                             double temperature, double top_p, int max_tokens,
+                             api_result_t *out) {
+    return api_complete_impl_for(NULL, model, messages_json, tools_json, temperature, top_p, max_tokens, out);
+}
+
 int api_complete(const char *model, const char *messages_json,
                  double temperature, double top_p, int max_tokens,
                  api_result_t *out) {
     return api_complete_impl(model, messages_json, NULL, temperature, top_p, max_tokens, out);
 }
 
+int api_complete_for(const char *provider, const char *model, const char *messages_json,
+                     double temperature, double top_p, int max_tokens,
+                     api_result_t *out) {
+    return api_complete_impl_for(provider, model, messages_json, NULL, temperature, top_p, max_tokens, out);
+}
+
 int api_complete_agent(const char *model, const char *messages_json, const char *tools_json,
                        double temperature, double top_p, int max_tokens,
                        api_result_t *out) {
     return api_complete_impl(model, messages_json, tools_json, temperature, top_p, max_tokens, out);
+}
+
+int api_complete_agent_for(const char *provider, const char *model,
+                           const char *messages_json, const char *tools_json,
+                           double temperature, double top_p, int max_tokens,
+                           api_result_t *out) {
+    return api_complete_impl_for(provider, model, messages_json, tools_json, temperature, top_p, max_tokens, out);
 }
 
 void api_result_free(api_result_t *r) {
@@ -689,7 +722,13 @@ static void *mm_one_t(void *arg) {
     int idx = a->idx;
     mm_result_t *r = &all->results[idx];
     if (all->stop) return NULL;
-    int rc = api_complete(all->models[idx], all->messages_json,
+    const char *prov = all->providers ? all->providers[idx] : NULL;
+    int rc;
+    if (prov && prov[0])
+        rc = api_complete_for(prov, all->models[idx], all->messages_json,
+                              all->temperature, all->top_p, all->max_tokens, &r->res);
+    else
+        rc = api_complete(all->models[idx], all->messages_json,
                           all->temperature, all->top_p, all->max_tokens, &r->res);
     if (rc != 0) {
         r->err = 1;

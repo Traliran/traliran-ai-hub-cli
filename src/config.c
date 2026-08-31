@@ -110,3 +110,33 @@ bool config_has_key(void) {
     if (!config_key_required()) return true;   /* local providers need no key */
     return g_cfg.api_key[0] != '\0';
 }
+
+void config_get_key_for(const char *provider, char *out, size_t outsz) {
+    if (!provider || !out || outsz == 0) return;
+    char keyname[128];
+    snprintf(keyname, sizeof(keyname), "gem_key_%s", provider);
+    const char *v = storage_get(keyname);
+    snprintf(out, outsz, "%s", v ? v : "");
+}
+
+void config_get_endpoint_for(const char *provider, char *out, size_t outsz) {
+    if (!provider || !out || outsz == 0) return;
+    char keyname[128];
+    snprintf(keyname, sizeof(keyname), "gem_endpoint_%s", provider);
+    const char *v = storage_get(keyname);
+    if (v && v[0]) {
+        snprintf(out, outsz, "%s", v);
+    } else {
+        const provider_t *p = providers_get(provider);
+        snprintf(out, outsz, "%s", p ? p->url : "");
+    }
+}
+
+bool config_has_key_for(const char *provider) {
+    const provider_t *p = providers_get(provider);
+    if (!p) return false;
+    if (!p->has_key) return true;
+    char key[2048];
+    config_get_key_for(provider, key, sizeof(key));
+    return key[0] != '\0';
+}

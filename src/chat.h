@@ -72,11 +72,18 @@ char *stream_snapshot_reasoning(stream_t *s);
 int   api_complete(const char *model, const char *messages_json,
                    double temperature, double top_p, int max_tokens,
                    api_result_t *out);
+int   api_complete_for(const char *provider, const char *model, const char *messages_json,
+                       double temperature, double top_p, int max_tokens,
+                       api_result_t *out);
 /* same as api_complete, but registers the given tools array (JSON) on the request
  * so tool-capable models may call them natively instead of via text JSON */
 int   api_complete_agent(const char *model, const char *messages_json, const char *tools_json,
                          double temperature, double top_p, int max_tokens,
                          api_result_t *out);
+int   api_complete_agent_for(const char *provider, const char *model,
+                             const char *messages_json, const char *tools_json,
+                             double temperature, double top_p, int max_tokens,
+                             api_result_t *out);
 int   api_stream(const char *model, const char *messages_json,
                  double temperature, double top_p, int max_tokens,
                  stream_t *st);
@@ -94,8 +101,9 @@ typedef struct {
 
 void *send_worker(void *arg);
 
-/* multi-model parallel worker */
+/* multi-model parallel worker - cross-provider: each entry has provider+model */
 typedef struct {
+    char        *provider; /* provider id, e.g. "groq", "openai" */
     char        *model;
     api_result_t res;
     int          err;
@@ -103,6 +111,7 @@ typedef struct {
 } mm_result_t;
 
 typedef struct {
+    char        **providers; /* parallel to models, malloc'd provider ids (may be NULL => g_cfg.provider) */
     char        **models;
     int           nmodels;
     char         *messages_json;

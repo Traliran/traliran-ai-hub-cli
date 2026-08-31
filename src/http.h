@@ -20,6 +20,7 @@ void         http_global_init(void);
 void         http_global_cleanup(void);
 
 http_res_t  *http_get(const char *url, const char *bearer);
+http_res_t  *http_get_ex(const char *url, const char *bearer, const char *x_api_key);
 http_res_t  *http_post_json(const char *url, const char *bearer,
                             const char *x_api_key, const char *json_body);
 int          http_post_json_stream(const char *url, const char *bearer,
