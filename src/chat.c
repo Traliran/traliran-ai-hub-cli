@@ -667,7 +667,7 @@ char *chat_build_system(const char *user_text) {
         }
     }
     const char *hint = cyr
-        ? "Ответь на русском языке. Answer in the same language as the user's prompt and keep the response complete, without cutting off the answer mid-sentence."
+        ? "Answer in Russian. Answer in the same language as the user's prompt and keep the response complete, without cutting off the answer mid-sentence."
         : "Answer in the same language as the user's prompt and keep the response complete, without cutting off the answer mid-sentence.";
     if (p.len) sbuf_append(&p, "\n\n");
     sbuf_append(&p, hint);

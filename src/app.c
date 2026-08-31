@@ -777,36 +777,24 @@ static void multi_model_dialog(void) {
                 }
             } else {
                 int mi = r->model_idx;
+                bool ck = checked[mi];
                 if (is_sel) wattron(list, A_REVERSE);
+                if (ck) wattron(list, COLOR_PAIR(MD_GREEN) | A_BOLD);
                 char label[512];
-                snprintf(label, sizeof(label), "[%c] %s", checked[mi] ? 'X' : ' ', g_models[mi]);
+                snprintf(label, sizeof(label), "[%c] %s", ck ? 'X' : ' ', g_models[mi]);
                 mvwprintw(list, i, 0, "%.*s", w - 4, label);
+                if (ck) wattroff(list, COLOR_PAIR(MD_GREEN) | A_BOLD);
                 if (is_sel) wattroff(list, A_REVERSE);
             }
         }
         wattrset(win, 0);
         int sel_cnt = 0; for (int i=0;i<g_nmodels;i++) if (checked[i]) sel_cnt++;
-        mvwprintw(win, h - 2, 2, "Space: toggle  Enter: run  [c]:clear  [a]:all  Esc: cancel  (%d sel)", sel_cnt);
-        mvwprintw(win, h - 1, 2, "Grouped by provider - missing key shows hint (%d models cached)", g_nmodels);
+        mvwprintw(win, h - 2, 2, "Space/Enter: toggle  [c]: clear  [a]: select all  Esc: save & close (%d selected)", sel_cnt);
+        mvwprintw(win, h - 1, 2, "Menu stays open until Esc — select models to compare (%d cached)", g_nmodels);
         wrefresh(list);
         wrefresh(win);
         int ch = getch();
-        if (ch == 27) done = true;
-        else if (ch == KEY_UP) {
-            int cur = sel_disp - 1;
-            while (cur >= 0 && disp[cur].kind != 1) cur--;
-            if (cur >= 0) sel_disp = cur;
-        } else if (ch == KEY_DOWN) {
-            int cur = sel_disp + 1;
-            while (cur < disp_n && disp[cur].kind != 1) cur++;
-            if (cur < disp_n) sel_disp = cur;
-        } else if (ch == ' ') {
-            if (disp[sel_disp].kind == 1) checked[disp[sel_disp].model_idx] = !checked[disp[sel_disp].model_idx];
-        } else if (ch == 'c' || ch == 'C') {
-            for (int i = 0; i < g_nmodels; i++) checked[i] = false;
-        } else if (ch == 'a' || ch == 'A') {
-            for (int i = 0; i < g_nmodels; i++) checked[i] = true;
-        } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+        if (ch == 27) {
             multi_free();
             for (int i = 0; i < g_nmodels; i++)
                 if (checked[i]) {
@@ -817,6 +805,22 @@ static void multi_model_dialog(void) {
                     g_nmulti++;
                 }
             done = true;
+        } else if (ch == KEY_UP) {
+            int cur = sel_disp - 1;
+            while (cur >= 0 && disp[cur].kind != 1) cur--;
+            if (cur >= 0) sel_disp = cur;
+        } else if (ch == KEY_DOWN) {
+            int cur = sel_disp + 1;
+            while (cur < disp_n && disp[cur].kind != 1) cur++;
+            if (cur < disp_n) sel_disp = cur;
+        } else if (ch == ' ') {
+            if (disp[sel_disp].kind == 1) checked[disp[sel_disp].model_idx] = !checked[disp[sel_disp].model_idx];
+        } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+            if (disp[sel_disp].kind == 1) checked[disp[sel_disp].model_idx] = !checked[disp[sel_disp].model_idx];
+        } else if (ch == 'c' || ch == 'C') {
+            for (int i = 0; i < g_nmodels; i++) checked[i] = false;
+        } else if (ch == 'a' || ch == 'A') {
+            for (int i = 0; i < g_nmodels; i++) checked[i] = true;
         }
     }
     delwin(list);
@@ -1315,6 +1319,111 @@ static void settings_select_provider(void) {
     delwin(win);
 }
 
+static void settings_manage_api_keys(void) {
+    const provider_t **all = providers_all();
+    int count = 0; while (all[count]) count++;
+    int h = count + 6, w = 78;
+    if (w > COLS - 4) w = COLS - 4;
+    if (h > LINES - 4) h = LINES - 4;
+    if (h < 10) h = 10;
+    int y0 = (LINES - h) / 2, x0 = (COLS - w) / 2;
+    WINDOW *win = tui_win(h, w, y0, x0);
+    WINDOW *list = tui_win(h - 4, w - 2, y0 + 2, x0 + 1);
+    tui_box(win, "API Keys - Multi-Provider Management (for comparison & quick switch)");
+    int sel = 0;
+    bool done = false;
+    while (!done) {
+        werase(list);
+        for (int i = 0; i < count; i++) {
+            const char *pid = all[i]->id;
+            char keybuf[2048];
+            config_get_key_for(pid, keybuf, sizeof(keybuf));
+            char epbuf[1024];
+            config_get_endpoint_for(pid, epbuf, sizeof(epbuf));
+            bool has = config_has_key_for(pid);
+            bool is_active = !strcmp(pid, g_cfg.provider);
+            const char *status = has ? (all[i]->has_key ? "**** (set)" : "(no key required)") : "(not set)";
+            if (i == sel) wattron(list, A_REVERSE);
+            else if (has && all[i]->has_key) wattron(list, COLOR_PAIR(MD_GREEN));
+            else if (!has) wattron(list, COLOR_PAIR(MD_WARN));
+            char line[512];
+            snprintf(line, sizeof(line), "%-12s %-20s  %s%s", pid, status, epbuf, is_active ? "  [active]" : "");
+            mvwprintw(list, i, 0, "%.*s", w - 4, line);
+            if (i == sel) wattroff(list, A_REVERSE);
+            else if (has && all[i]->has_key) wattroff(list, COLOR_PAIR(MD_GREEN));
+            else if (!has) wattroff(list, COLOR_PAIR(MD_WARN));
+        }
+        int configured2 = 0; for (int i = 0; i < count; i++) if (config_has_key_for(all[i]->id)) configured2++;
+        mvwprintw(win, h - 2, 2, "Enter: edit key  e: endpoint  d: delete  p: set active  F: fetch  Esc: back (%d/%d set)", configured2, count);
+        mvwprintw(win, h - 1, 2, "Keys stored locally — quick switch with 'p', compare with F7 in Chat");
+        wrefresh(list);
+        wrefresh(win);
+        int ch = getch();
+        if (ch == 27) done = true;
+        else if (ch == KEY_UP && sel > 0) sel--;
+        else if (ch == KEY_DOWN && sel < count - 1) sel++;
+        else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+            char cur[2048];
+            config_get_key_for(all[sel]->id, cur, sizeof(cur));
+            char v[2048];
+            char title[128];
+            snprintf(title, sizeof(title), "API Key for %s", all[sel]->id);
+            if (tui_prompt(title, cur, v, sizeof(v))) {
+                char *t = str_trim(v);
+                char keyname[128];
+                snprintf(keyname, sizeof(keyname), "gem_key_%s", all[sel]->id);
+                storage_set(keyname, t);
+                storage_save();
+                if (!strcmp(all[sel]->id, g_cfg.provider)) {
+                    snprintf(g_cfg.api_key, sizeof(g_cfg.api_key), "%s", t);
+                }
+                fetch_models();
+            }
+        } else if (ch == 'e' || ch == 'E') {
+            char cur[1024];
+            config_get_endpoint_for(all[sel]->id, cur, sizeof(cur));
+            char v[1024];
+            char title[128];
+            snprintf(title, sizeof(title), "Endpoint for %s", all[sel]->id);
+            if (tui_prompt(title, cur, v, sizeof(v))) {
+                char *t = str_trim(v);
+                char keyname[128];
+                snprintf(keyname, sizeof(keyname), "gem_endpoint_%s", all[sel]->id);
+                storage_set(keyname, t);
+                storage_save();
+                if (!strcmp(all[sel]->id, g_cfg.provider)) {
+                    snprintf(g_cfg.endpoint, sizeof(g_cfg.endpoint), "%s", t);
+                }
+            }
+        } else if (ch == 'd' || ch == 'D') {
+            char keyname[128];
+            snprintf(keyname, sizeof(keyname), "gem_key_%s", all[sel]->id);
+            storage_set(keyname, "");
+            storage_save();
+            if (!strcmp(all[sel]->id, g_cfg.provider)) g_cfg.api_key[0] = '\0';
+        } else if (ch == 'p' || ch == 'P') {
+            snprintf(g_cfg.provider, sizeof(g_cfg.provider), "%s", all[sel]->id);
+            char epbuf[1024];
+            config_get_endpoint_for(all[sel]->id, epbuf, sizeof(epbuf));
+            snprintf(g_cfg.endpoint, sizeof(g_cfg.endpoint), "%s", epbuf);
+            char keybuf[2048];
+            config_get_key_for(all[sel]->id, keybuf, sizeof(keybuf));
+            snprintf(g_cfg.api_key, sizeof(g_cfg.api_key), "%s", keybuf);
+            config_save();
+            char *msg = xasprintf("Active provider: %s", all[sel]->id);
+            tui_alert(msg);
+            free(msg);
+        } else if (ch == 'f' || ch == 'F') {
+            fetch_models();
+            char *msg = xasprintf("Updated: %d models", g_nmodels);
+            tui_alert(msg);
+            free(msg);
+        }
+    }
+    delwin(list);
+    delwin(win);
+}
+
 static void settings_item(int idx, const char *label, const char *value, bool active) {
     int x = 4;
     if (active) wattron(w_main, A_REVERSE);
@@ -1327,11 +1436,11 @@ static void settings_item(int idx, const char *label, const char *value, bool ac
 }
 
 static void screen_settings_draw(void) {
-    const char *items[14];
-    char vals[14][2048];
+    const char *items[15];
+    char vals[15][2048];
     items[0] = "Provider";
     snprintf(vals[0], sizeof(vals[0]), "%s", g_cfg.provider);
-    items[1] = "API Key";
+    items[1] = "API Key (current)";
     snprintf(vals[1], sizeof(vals[1]), "%s", g_cfg.api_key[0] ? "********" : "(missing)");
     items[2] = "Endpoint";
     snprintf(vals[2], sizeof(vals[2]), "%s", config_endpoint());
@@ -1356,11 +1465,18 @@ static void screen_settings_draw(void) {
     items[12] = "Import Config JSON";
     vals[12][0] = '\0';
     items[13] = "Reset Multi-Model Selection";
-    snprintf(vals[13], sizeof(vals[13]), g_nmulti > 0 ? "%d selected" : "(none)", 0);
+    snprintf(vals[13], sizeof(vals[13]), g_nmulti > 0 ? "%d selected" : "(none)", g_nmulti);
+    items[14] = "Manage All API Keys (multi)";
+    {
+        int configured = 0, total = 0;
+        const provider_t **all = providers_all();
+        for (int i = 0; all[i]; i++) { total++; if (config_has_key_for(all[i]->id)) configured++; }
+        snprintf(vals[14], sizeof(vals[14]), "%d/%d configured", configured, total);
+    }
 
     werase(w_main);
     mvwprintw(w_main, 0, 2, "Configuration (mirrors the web app settings)");
-    for (int i = 0; i < 14; i++) {
+    for (int i = 0; i < 15; i++) {
         settings_item(i, items[i], vals[i], i == g_settings_sel);
     }
     mvwprintw(w_main, getmaxy(w_main) - 1, 2, "Up/Down: move   Enter: edit   F1: help   Esc: back");
@@ -1368,7 +1484,7 @@ static void screen_settings_draw(void) {
 
 static void screen_settings_key(int ch) {
     if (ch == KEY_UP && g_settings_sel > 0) g_settings_sel--;
-    else if (ch == KEY_DOWN && g_settings_sel < 13) g_settings_sel++;
+    else if (ch == KEY_DOWN && g_settings_sel < 14) g_settings_sel++;
     else if (ch == 27) g_screen = SCREEN_CHAT;
     else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
         switch (g_settings_sel) {
@@ -1591,6 +1707,7 @@ static void screen_settings_key(int ch) {
                 break;
             }
             case 13: multi_free(); break;
+            case 14: settings_manage_api_keys(); config_load(); fetch_models(); break;
         }
     }
 }
