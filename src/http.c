@@ -11,7 +11,7 @@
 #include "http.h"
 
 #ifndef HUB_VERSION
-#define HUB_VERSION "1.1.0-test-1"
+#define HUB_VERSION "1.1.0-test-2"
 #endif
 
 void http_global_init(void)    { curl_global_init(CURL_GLOBAL_DEFAULT); }

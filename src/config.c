@@ -140,3 +140,28 @@ bool config_has_key_for(const char *provider) {
     config_get_key_for(provider, key, sizeof(key));
     return key[0] != '\0';
 }
+
+void config_switch_provider(const char *new_provider) {
+    if (!new_provider || !new_provider[0]) return;
+    if (!strcmp(g_cfg.provider, new_provider)) return;
+    const provider_t *np = providers_find(new_provider);
+    if (!np) return;
+    /* Save current provider's per-provider state before leaving it.
+     * config_save() persists gem_provider, gem_key_<old>, gem_endpoint_<old>,
+     * gem_selected_model_<old> and global settings. This guarantees the old
+     * provider's endpoint/api/model are preserved and can be restored when
+     * switching back. */
+    config_save();
+    /* Switch to new provider id */
+    snprintf(g_cfg.provider, sizeof(g_cfg.provider), "%s", new_provider);
+    /* Restore new provider's saved key/endpoint/model from storage.
+     * If nothing was saved yet, key will be empty and endpoint falls back to
+     * the provider's default URL (preserves backward compatibility). */
+    config_get_key_for(new_provider, g_cfg.api_key, sizeof(g_cfg.api_key));
+    config_get_endpoint_for(new_provider, g_cfg.endpoint, sizeof(g_cfg.endpoint));
+    const char *mk = model_key(new_provider);
+    const char *saved_model = storage_get(mk);
+    snprintf(g_cfg.selected_model, sizeof(g_cfg.selected_model), "%s", saved_model ? saved_model : "");
+    /* Persist the new active provider (and its restored per-provider fields). */
+    config_save();
+}

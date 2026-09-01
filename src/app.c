@@ -1309,9 +1309,7 @@ static void settings_select_provider(void) {
         else if (ch == KEY_UP && sel > 0) sel--;
         else if (ch == KEY_DOWN && sel < count - 1) sel++;
         else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
-            snprintf(g_cfg.provider, sizeof(g_cfg.provider), "%s", all[sel]->id);
-            if (!g_cfg.endpoint[0]) snprintf(g_cfg.endpoint, sizeof(g_cfg.endpoint), "%s", all[sel]->url);
-            config_save();
+            config_switch_provider(all[sel]->id);
             done = true;
         }
     }
@@ -1402,14 +1400,7 @@ static void settings_manage_api_keys(void) {
             storage_save();
             if (!strcmp(all[sel]->id, g_cfg.provider)) g_cfg.api_key[0] = '\0';
         } else if (ch == 'p' || ch == 'P') {
-            snprintf(g_cfg.provider, sizeof(g_cfg.provider), "%s", all[sel]->id);
-            char epbuf[1024];
-            config_get_endpoint_for(all[sel]->id, epbuf, sizeof(epbuf));
-            snprintf(g_cfg.endpoint, sizeof(g_cfg.endpoint), "%s", epbuf);
-            char keybuf[2048];
-            config_get_key_for(all[sel]->id, keybuf, sizeof(keybuf));
-            snprintf(g_cfg.api_key, sizeof(g_cfg.api_key), "%s", keybuf);
-            config_save();
+            config_switch_provider(all[sel]->id);
             char *msg = xasprintf("Active provider: %s", all[sel]->id);
             tui_alert(msg);
             free(msg);
@@ -1488,7 +1479,7 @@ static void screen_settings_key(int ch) {
     else if (ch == 27) g_screen = SCREEN_CHAT;
     else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
         switch (g_settings_sel) {
-            case 0: settings_select_provider(); config_load(); fetch_models(); break;
+            case 0: settings_select_provider(); fetch_models(); break;
             case 1: {
                 char v[2048];
                 if (tui_prompt("API Key", g_cfg.api_key, v, sizeof(v))) {
@@ -1633,9 +1624,7 @@ static void screen_settings_key(int ch) {
                             int mi = disp[sel_disp].model_idx;
                             const char *pid = g_model_providers[mi];
                             if (pid && strcmp(pid, g_cfg.provider)) {
-                                snprintf(g_cfg.provider, sizeof(g_cfg.provider), "%s", pid);
-                                config_load();
-                                snprintf(g_cfg.provider, sizeof(g_cfg.provider), "%s", pid);
+                                config_switch_provider(pid);
                             }
                             snprintf(g_cfg.selected_model, sizeof(g_cfg.selected_model), "%s", g_models[mi]);
                             config_save();
@@ -1707,7 +1696,7 @@ static void screen_settings_key(int ch) {
                 break;
             }
             case 13: multi_free(); break;
-            case 14: settings_manage_api_keys(); config_load(); fetch_models(); break;
+            case 14: settings_manage_api_keys(); fetch_models(); break;
         }
     }
 }
