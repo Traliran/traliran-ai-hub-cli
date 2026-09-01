@@ -14,7 +14,7 @@
 cfg_t g_cfg;
 
 static const char *model_key(const char *provider) {
-    static char buf[128];
+    static __thread char buf[128];
     snprintf(buf, sizeof(buf), "gem_selected_model_%s", provider);
     return buf;
 }

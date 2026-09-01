@@ -212,7 +212,7 @@ static void fetch_models_for_provider(const char *pid) {
     }
 
     /* also try local providers, but on failure fall back to cache */
-    char url[2048];
+    char url[4096];
     snprintf(url, sizeof(url), "%s/models", endpoint);
     http_res_t *r = NULL;
     if (!strcmp(pr->type, "anthropic")) {
@@ -1344,7 +1344,7 @@ static void settings_manage_api_keys(void) {
             if (i == sel) wattron(list, A_REVERSE);
             else if (has && all[i]->has_key) wattron(list, COLOR_PAIR(MD_GREEN));
             else if (!has) wattron(list, COLOR_PAIR(MD_WARN));
-            char line[512];
+            char line[2048];
             snprintf(line, sizeof(line), "%-12s %-20s  %s%s", pid, status, epbuf, is_active ? "  [active]" : "");
             mvwprintw(list, i, 0, "%.*s", w - 4, line);
             if (i == sel) wattroff(list, A_REVERSE);

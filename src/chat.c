@@ -17,6 +17,8 @@
 #include "http.h"
 #include "chat.h"
 
+static pthread_mutex_t g_cjson_mtx = PTHREAD_MUTEX_INITIALIZER;
+
 /* =================== sessions =================== */
 
 static msg_t *msg_new(const char *role, const char *content) {
@@ -328,6 +330,7 @@ static int sse_cb(const char *data, size_t len, void *ud) {
 
 static char *extract_error_message(const char *body) {
     if (!body) return xstrdup("Unknown error");
+    pthread_mutex_lock(&g_cjson_mtx);
     cJSON *j = cJSON_Parse(body);
     if (j) {
         cJSON *err = cJSON_GetObjectItem(j, "error");
@@ -339,15 +342,19 @@ static char *extract_error_message(const char *body) {
             msg = xstrdup(err->valuestring);
         }
         cJSON_Delete(j);
+        pthread_mutex_unlock(&g_cjson_mtx);
         if (msg) return msg;
+    } else {
+        pthread_mutex_unlock(&g_cjson_mtx);
     }
     return xasprintf("HTTP error: %.*s", 200, body ? body : "");
 }
 
 static char *build_openai_payload(const char *model, const char *messages_json,
-                                  const char *tools_json,
-                                  double temperature, double top_p, int max_tokens,
-                                  bool stream) {
+                                   const char *tools_json,
+                                   double temperature, double top_p, int max_tokens,
+                                   bool stream) {
+    pthread_mutex_lock(&g_cjson_mtx);
     cJSON *j = cJSON_CreateObject();
     cJSON_AddStringToObject(j, "model", model);
     cJSON *msgs = cJSON_Parse(messages_json);
@@ -376,6 +383,7 @@ static char *build_openai_payload(const char *model, const char *messages_json,
     if (stream) cJSON_AddBoolToObject(j, "stream", 1);
     char *out = cJSON_PrintUnformatted(j);
     cJSON_Delete(j);
+    pthread_mutex_unlock(&g_cjson_mtx);
     return out;
 }
 
@@ -445,6 +453,7 @@ static int api_complete_impl_for(const char *provider_id,
 
     if (!strcmp(pr->type, "anthropic")) {
         /* convert to anthropic /messages payload */
+        pthread_mutex_lock(&g_cjson_mtx);
         cJSON *msgs = cJSON_Parse(messages_json);
         cJSON *payload = cJSON_CreateObject();
         cJSON_AddStringToObject(payload, "model", model);
@@ -488,8 +497,9 @@ static int api_complete_impl_for(const char *provider_id,
         char *body = cJSON_PrintUnformatted(payload);
         cJSON_Delete(payload);
         if (msgs) cJSON_Delete(msgs);
+        pthread_mutex_unlock(&g_cjson_mtx);
 
-        char url[2048];
+        char url[4096];
         snprintf(url, sizeof(url), "%s/messages", ep);
         http_res_t *r = http_post_json(url, NULL, key, body);
         free(body);
@@ -501,9 +511,10 @@ static int api_complete_impl_for(const char *provider_id,
             http_res_free(r);
             return -1;
         }
+        pthread_mutex_lock(&g_cjson_mtx);
         cJSON *j = cJSON_Parse(r->body);
         http_res_free(r);
-        if (!j) return -1;
+        if (!j) { pthread_mutex_unlock(&g_cjson_mtx); return -1; }
         cJSON *carr = cJSON_GetObjectItem(j, "content");
         sbuf_t text;
         sbuf_init(&text);
@@ -535,12 +546,13 @@ static int api_complete_impl_for(const char *provider_id,
         out->content = sbuf_detach(&text);
         sbuf_free(&text);
         cJSON_Delete(j);
+        pthread_mutex_unlock(&g_cjson_mtx);
         return 0;
     }
 
     /* OpenAI-compatible */
     char *payload = build_openai_payload(model, messages_json, tools_json, temperature, top_p, max_tokens, false);
-    char url[2048];
+    char url[4096];
     snprintf(url, sizeof(url), "%s/chat/completions", ep);
     http_res_t *r = http_post_json(url, key, NULL, payload);
     free(payload);
@@ -552,9 +564,10 @@ static int api_complete_impl_for(const char *provider_id,
         http_res_free(r);
         return -1;
     }
+    pthread_mutex_lock(&g_cjson_mtx);
     cJSON *j = cJSON_Parse(r->body);
     http_res_free(r);
-    if (!j) return -1;
+    if (!j) { pthread_mutex_unlock(&g_cjson_mtx); return -1; }
     cJSON *choices = cJSON_GetObjectItem(j, "choices");
     if (choices && cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
         cJSON *c0 = cJSON_GetArrayItem(choices, 0);
@@ -577,6 +590,7 @@ static int api_complete_impl_for(const char *provider_id,
         out->reasoning = xstrdup("");
     }
     cJSON_Delete(j);
+    pthread_mutex_unlock(&g_cjson_mtx);
     return 0;
 }
 
