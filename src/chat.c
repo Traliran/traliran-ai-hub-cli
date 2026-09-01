@@ -39,7 +39,10 @@ static void session_free(session_t *s) {
     free(s->name);
     free(s->system_prompt);
     free(s->bot_name);
-    for (int i = 0; i < s->n; i++) msg_free(&s->messages[i]);
+    for (int i = 0; i < s->n; i++) {
+        free(s->messages[i].role);
+        free(s->messages[i].content);
+    }
     free(s->messages);
     pthread_mutex_destroy(&s->mtx);
     free(s);
@@ -61,7 +64,9 @@ void chat_msg_push(session_t *s, const char *role, const char *content) {
         s->cap = s->cap ? s->cap * 2 : 16;
         s->messages = realloc(s->messages, sizeof(msg_t) * (size_t)s->cap);
     }
-    s->messages[s->n++] = *msg_new(role, content);
+    msg_t *tmp = msg_new(role, content);
+    s->messages[s->n++] = *tmp;
+    free(tmp);
     pthread_mutex_unlock(&s->mtx);
 }
 
