@@ -91,6 +91,14 @@ int   api_stream(const char *model, const char *messages_json,
 /* build system prompt mirroring the web app (personal info + language hint) */
 char *chat_build_system(const char *user_text);
 
+/* progress indicator helper */
+typedef struct {
+    char             text[256];
+    pthread_mutex_t  mtx;
+} progress_t;
+
+void progress_set(progress_t *p, const char *fmt, ...);
+
 /* single-model send worker */
 typedef struct {
     session_t *session;
@@ -100,6 +108,23 @@ typedef struct {
 } send_arg_t;
 
 void *send_worker(void *arg);
+
+/* MCP agentic send worker (single-model + tools) */
+typedef struct {
+    session_t *session;
+    char      *model;
+    stream_t   stream;
+    progress_t *progress;
+} mcp_send_arg_t;
+
+void *mcp_send_worker(void *arg);
+
+/* Check whether MCP agentic mode should be used for the current config.
+ * n_multi is the number of selected multi-model entries (0 = single model). */
+bool chat_mcp_should_use(int n_multi);
+
+/* Build MCP system note (malloc'd, caller free). Empty string if no MCP. */
+char *chat_mcp_build_system_note(void);
 
 /* multi-model parallel worker - cross-provider: each entry has provider+model */
 typedef struct {
@@ -123,14 +148,6 @@ typedef struct {
 } mm_arg_t;
 
 void *multi_worker(void *arg);
-
-/* progress indicator helper */
-typedef struct {
-    char             text[256];
-    pthread_mutex_t  mtx;
-} progress_t;
-
-void progress_set(progress_t *p, const char *fmt, ...);
 
 /* debate worker (3 agents x 2 rounds) */
 typedef struct {

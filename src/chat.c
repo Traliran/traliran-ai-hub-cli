@@ -15,6 +15,7 @@
 #include "providers.h"
 #include "config.h"
 #include "http.h"
+#include "mcp.h"
 #include "chat.h"
 
 static pthread_mutex_t g_cjson_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -725,6 +726,232 @@ void *send_worker(void *arg) {
     char *msgs = session_messages_json(a->session, NULL);
     api_stream(a->model, msgs, g_cfg.temperature, g_cfg.top_p, g_cfg.max_tokens, &a->stream);
     free(msgs);
+    return NULL;
+}
+
+/* =================== MCP agentic loop =================== */
+
+bool chat_mcp_should_use(int n_multi) {
+    if (n_multi > 0) return false;
+    if (!mcp_is_ready()) return false;
+    /* Text-JSON protocol works for all providers (no native tools sent). */
+    return true;
+}
+
+char *chat_mcp_build_system_note(void) {
+    return mcp_build_system_note();
+}
+
+/* Parse plain-text JSON tool call: {"tool":"<fnName>","arguments":{...}}.
+ * Mirrors ide.c:776 and rag.c:286 - finds first balanced {...} with required fields.
+ * Returns malloc'd JSON string (caller free) or NULL if not a tool call. */
+static char *mcp_parse_tool_call(const char *text) {
+    if (!text) return NULL;
+    const char *open = strchr(text, '{');
+    if (!open) return NULL;
+    int depth = 0;
+    bool in_str = false;
+    const char *p = open;
+    for (; *p; p++) {
+        if (*p == '"' && (p == open || *(p - 1) != '\\')) in_str = !in_str;
+        if (!in_str) {
+            if (*p == '{') depth++;
+            else if (*p == '}') {
+                depth--;
+                if (depth == 0) {
+                    cJSON *j = cJSON_ParseWithLength(open, (size_t)(p - open) + 1);
+                    if (!j) return NULL;
+                    cJSON *tool = cJSON_GetObjectItem(j, "tool");
+                    cJSON *args = cJSON_GetObjectItem(j, "arguments");
+                    if (tool && cJSON_IsString(tool) && args && cJSON_IsObject(args)) {
+                        cJSON_Delete(j);
+                        return xstrndup(open, (size_t)(p - open) + 1);
+                    }
+                    cJSON_Delete(j);
+                    return NULL;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Helper: call LLM without any native tools (tools section absent).
+ * The MCP tools are described only in the system prompt and the model
+ * emits text JSON which we parse with mcp_parse_tool_call().
+ * On success returns 0, *out_content is malloc'd. */
+static int mcp_llm_call(const char *model, cJSON *messages,
+                        char **out_content, char **out_error) {
+    if (!model || !messages) return -1;
+    pthread_mutex_lock(&g_cjson_mtx);
+    char *messages_json = cJSON_PrintUnformatted(messages);
+    pthread_mutex_unlock(&g_cjson_mtx);
+    if (!messages_json) return -1;
+    int rc = 0;
+    api_result_t res = {0};
+    /* api_complete does NOT send any tools section - compliant with requirement. */
+    rc = api_complete(model, messages_json, g_cfg.temperature, g_cfg.top_p, g_cfg.max_tokens, &res);
+    free(messages_json);
+    if (rc != 0) {
+        if (out_error) *out_error = xstrdup(res.content ? res.content : "LLM call failed");
+        api_result_free(&res);
+        return -1;
+    }
+    if (out_content) *out_content = res.content ? xstrdup(res.content) : xstrdup("");
+    else free(res.content);
+    free(res.reasoning);
+    return 0;
+}
+
+static void mcp_stream_append(stream_t *st, const char *text) {
+    if (!st || !text) return;
+    pthread_mutex_lock(&st->mtx);
+    size_t len = st->content ? strlen(st->content) : 0;
+    size_t n = strlen(text);
+    size_t cap = len + n + 1;
+    st->content = realloc(st->content, cap);
+    memcpy(st->content + len, text, n);
+    st->content[len + n] = '\0';
+    pthread_mutex_unlock(&st->mtx);
+}
+
+void *mcp_send_worker(void *arg) {
+    mcp_send_arg_t *a = arg;
+    session_t *s = a->session;
+    const char *model = a->model;
+    stream_t *st = &a->stream;
+
+    char *note = mcp_build_system_note();
+    /* Build initial conversation array - NO tools field is ever sent. */
+    cJSON *conv = cJSON_CreateArray();
+    sbuf_t sys;
+    sbuf_init(&sys);
+    if (s->system_prompt && s->system_prompt[0]) sbuf_append(&sys, s->system_prompt);
+    if (note && note[0]) {
+        if (sys.len) sbuf_append(&sys, "\n\n");
+        sbuf_append(&sys, note);
+    }
+    if (sys.len) {
+        cJSON *m = cJSON_CreateObject();
+        cJSON_AddStringToObject(m, "role", "system");
+        cJSON_AddStringToObject(m, "content", sys.s);
+        cJSON_AddItemToArray(conv, m);
+    }
+    sbuf_free(&sys);
+    free(note);
+
+    pthread_mutex_lock(&s->mtx);
+    for (int i = 0; i < s->n; i++) {
+        cJSON *m = cJSON_CreateObject();
+        cJSON_AddStringToObject(m, "role", s->messages[i].role);
+        cJSON_AddStringToObject(m, "content", s->messages[i].content);
+        cJSON_AddItemToArray(conv, m);
+    }
+    pthread_mutex_unlock(&s->mtx);
+
+    const int MAX_ITER = 8;
+    char *final_content = NULL;
+
+    for (int iter = 0; iter < MAX_ITER; iter++) {
+        pthread_mutex_lock(&st->mtx);
+        bool stopped = st->stop;
+        pthread_mutex_unlock(&st->mtx);
+        if (stopped) break;
+        if (a->progress) progress_set(a->progress, "MCP agent iteration %d/%d...", iter + 1, MAX_ITER);
+
+        char *llm_content = NULL;
+        char *err = NULL;
+        int rc = mcp_llm_call(model, conv, &llm_content, &err);
+        if (rc != 0) {
+            char *msg = err ? err : xstrdup("LLM call failed");
+            mcp_stream_append(st, msg);
+            free(msg);
+            free(err);
+            free(llm_content);
+            break;
+        }
+
+        char *tool_json = mcp_parse_tool_call(llm_content);
+        if (!tool_json) {
+            /* No tool call -> final answer */
+            final_content = llm_content ? llm_content : xstrdup("");
+            break;
+        }
+
+        /* Tool call found - execute it */
+        cJSON *tj = cJSON_Parse(tool_json);
+        cJSON *tool_item = cJSON_GetObjectItem(tj, "tool");
+        cJSON *args_item = cJSON_GetObjectItem(tj, "arguments");
+        const char *tool_name = tool_item && cJSON_IsString(tool_item) ? tool_item->valuestring : "";
+        char *args_str = NULL;
+        if (args_item) args_str = cJSON_PrintUnformatted(args_item);
+        else args_str = xstrdup("{}");
+        if (!tool_name[0]) {
+            cJSON_Delete(tj);
+            free(tool_json);
+            free(args_str);
+            final_content = llm_content ? llm_content : xstrdup("");
+            break;
+        }
+
+        /* Stream UI trace */
+        mcp_stream_append(st, xasprintf("\n🔧 %s — calling...\n", tool_name));
+        if (a->progress) progress_set(a->progress, "Calling MCP tool %s...", tool_name);
+
+        char *tool_result = NULL;
+        int trc = mcp_call_tool(tool_name, args_str, &tool_result);
+        if (trc != 0 && !tool_result) tool_result = xstrdup("MCP tool error");
+
+        char *trace_line = xasprintf("  -> %.500s\n", tool_result ? tool_result : "");
+        mcp_stream_append(st, trace_line);
+        free(trace_line);
+
+        /* Feed result back as user message (text-JSON protocol, no native tool role). */
+        char *result_note = xasprintf("[Tool result from %s]:\n%s", tool_name, tool_result ? tool_result : "");
+        cJSON *um = cJSON_CreateObject();
+        cJSON_AddStringToObject(um, "role", "user");
+        cJSON_AddStringToObject(um, "content", result_note);
+        cJSON_AddItemToArray(conv, um);
+        free(result_note);
+        free(tool_result);
+        free(args_str);
+        cJSON_Delete(tj);
+        free(tool_json);
+        free(llm_content);
+
+        if (iter == MAX_ITER - 1) {
+            /* Max iterations: one more LLM call to synthesize final answer */
+            char *final_llm = NULL;
+            char *ferr = NULL;
+            int frc = mcp_llm_call(model, conv, &final_llm, &ferr);
+            free(ferr);
+            if (frc == 0 && final_llm) final_content = final_llm;
+            else { free(final_llm); final_content = xstrdup("(No response after max iterations)"); }
+            break;
+        }
+    }
+
+    if (!final_content) {
+        pthread_mutex_lock(&st->mtx);
+        char *cur = st->content ? xstrdup(st->content) : xstrdup("");
+        pthread_mutex_unlock(&st->mtx);
+        if (cur[0]) final_content = cur;
+        else { free(cur); final_content = xstrdup("(No response)"); }
+    } else {
+        pthread_mutex_lock(&st->mtx);
+        free(st->content);
+        st->content = xstrdup(final_content);
+        pthread_mutex_unlock(&st->mtx);
+    }
+
+    cJSON_Delete(conv);
+    if (a->progress) progress_set(a->progress, "");
+    if (final_content) {
+        pthread_mutex_lock(&st->mtx);
+        bool same = st->content == final_content;
+        pthread_mutex_unlock(&st->mtx);
+        if (!same) free(final_content);
+    }
     return NULL;
 }
 

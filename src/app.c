@@ -24,6 +24,7 @@
 #include "rag.h"
 #include "ide.h"
 #include "sandbox.h"
+#include "mcp.h"
 #include "app.h"
 
 #ifndef KEY_CTRL
@@ -373,6 +374,56 @@ static bool chat_validate(void) {
 }
 
 static void chat_send_single(session_t *s, const char *model) {
+    /* MCP agentic path: single-model + MCP ready */
+    if (chat_mcp_should_use(g_nmulti)) {
+        mcp_send_arg_t *ma = calloc(1, sizeof(*ma));
+        ma->session = s;
+        ma->model = xstrdup(model);
+        stream_init(&ma->stream);
+        ma->progress = &g_progress;
+        g_active_stream = &ma->stream;
+        g_job_stop = 0;
+        progress_set(&g_progress, "MCP agent starting...");
+        job_start(&g_job, mcp_send_worker, ma);
+        run_job_ui();
+        job_join(&g_job);
+        g_active_stream = NULL;
+        progress_set(&g_progress, "");
+
+        stream_t *st = &ma->stream;
+        if (st->error) {
+            char *err = xasprintf("Execution Interrupted: %s", st->error);
+            chat_msg_push(s, "assistant", err);
+            free(err);
+        } else if (st->stop) {
+            chat_msg_push(s, "assistant", "_Generation stopped by user._");
+        } else {
+            char *content = stream_snapshot_content(st);
+            char *reasoning = stream_snapshot_reasoning(st);
+            char *final;
+            if (reasoning && reasoning[0])
+                final = xasprintf(" thinking%s response\n%s", reasoning, content);
+            else
+                final = xstrdup(content);
+            if (!final[0]) { free(final); final = xstrdup("(No response)"); }
+            chat_msg_push(s, "assistant", final);
+            free(content);
+            free(reasoning);
+            free(final);
+            if (s->n >= 2) {
+                g_last_tokens = (int)estimate_tokens(s->messages[s->n - 2].content) +
+                                (int)estimate_tokens(s->messages[s->n - 1].content);
+                g_last_cost = (g_last_tokens / 1000.0) * 0.03;
+            }
+        }
+        chat_save(&g_chat);
+        chat_rebuild_view(true);
+        stream_free(st);
+        free(ma->model);
+        free(ma);
+        return;
+    }
+
     send_arg_t *a = calloc(1, sizeof(*a));
     a->session = s;
     a->model = xstrdup(model);
@@ -1415,6 +1466,140 @@ static void settings_manage_api_keys(void) {
     delwin(win);
 }
 
+static void mcp_manage_dialog(void) {
+    int sel = 0;
+    bool done = false;
+    while (!done) {
+        int n = mcp_server_count();
+        int h = LINES - 6, w = COLS - 8;
+        if (h < 12) h = 12;
+        if (w < 60) w = 60;
+        if (w > COLS - 4) w = COLS - 4;
+        if (h > LINES - 4) h = LINES - 4;
+        int y0 = (LINES - h) / 2, x0 = (COLS - w) / 2;
+        WINDOW *win = tui_win(h, w, y0, x0);
+        WINDOW *list = tui_win(h - 4, w - 2, y0 + 2, x0 + 1);
+        char title[128];
+        int tc = mcp_tool_count();
+        int cc = mcp_connected_count();
+        if (tc > 0) snprintf(title, sizeof(title), "MCP Servers — %d tool(s) from %d server(s)", tc, cc);
+        else snprintf(title, sizeof(title), "MCP Servers — not connected");
+        tui_box(win, title);
+        werase(list);
+        if (n == 0) {
+            mvwprintw(list, 1, 0, "No MCP servers configured.");
+            mvwprintw(list, 2, 0, "Press 'a' to add a server.");
+            mvwprintw(list, 4, 0, "Example: Name=MyServer  URL=https://host/mcp  Auth=Bearer xxx");
+        } else {
+            for (int i = 0; i < n && i < h - 6; i++) {
+                const mcp_server_t *srv = mcp_get_server(i);
+                const mcp_client_t *cl = mcp_get_client(srv->id);
+                bool connected = cl && cl->connected;
+                int ntools = cl ? cl->ntools : 0;
+                if (i == sel) wattron(list, A_REVERSE);
+                else if (connected) wattron(list, COLOR_PAIR(MD_GREEN));
+                else wattron(list, COLOR_PAIR(MD_WARN));
+                char line[512];
+                if (connected) snprintf(line, sizeof(line), "%s  %s  (%d tools) %s", srv->name, srv->url, ntools, "connected");
+                else snprintf(line, sizeof(line), "%s  %s  %s", srv->name, srv->url, "disconnected");
+                mvwprintw(list, i, 0, "%.*s", w - 4, line);
+                if (i == sel) wattroff(list, A_REVERSE);
+                else if (connected) wattroff(list, COLOR_PAIR(MD_GREEN));
+                else wattroff(list, COLOR_PAIR(MD_WARN));
+                /* show tool names on next row if selected */
+                if (i == sel && connected && cl && ntools > 0) {
+                    wattron(list, COLOR_PAIR(MD_DIM));
+                    sbuf_t tb;
+                    sbuf_init(&tb);
+                    for (int t = 0; t < ntools && t < 8; t++) {
+                        if (t) sbuf_append(&tb, ", ");
+                        sbuf_append(&tb, cl->tools[t].name);
+                    }
+                    if (ntools > 8) sbuf_append(&tb, "...");
+                    mvwprintw(list, i + 1, 2, "tools: %.*s", w - 8, tb.s);
+                    sbuf_free(&tb);
+                    wattroff(list, COLOR_PAIR(MD_DIM));
+                }
+            }
+        }
+        mvwprintw(win, h - 2, 2, "a:add  r:reconnect  d:delete  Esc:back  (%d servers)", n);
+        if (n > 0) mvwprintw(win, h - 1, 2, "Up/Down: select  Enter: reconnect");
+        wrefresh(list);
+        wrefresh(win);
+        int ch = getch();
+        delwin(list);
+        delwin(win);
+        switch (ch) {
+            case 27: done = true; break;
+            case KEY_UP: if (sel > 0) sel--; break;
+            case KEY_DOWN: if (sel < n - 1) sel++; break;
+            case '\n': case '\r': case KEY_ENTER: {
+                if (n == 0) break;
+                const mcp_server_t *srv = mcp_get_server(sel);
+                if (!srv) break;
+                char err[512] = {0};
+                int rc = mcp_connect_one(srv->id, err, sizeof(err));
+                if (rc == 0) tui_alert("Reconnected successfully.");
+                else { char *msg = xasprintf("Failed to connect: %s", err[0] ? err : "unknown"); tui_alert(msg); free(msg); }
+                break;
+            }
+            case 'a': case 'A': {
+                char name[256] = {0}, url[1024] = {0}, auth[1024] = {0};
+                if (!tui_prompt("MCP Server Name", "", name, sizeof(name))) break;
+                char *tn = str_dup_trim(name);
+                if (!tn[0]) { free(tn); tui_alert("Name is required."); break; }
+                if (!tui_prompt("MCP Server URL (https://host/mcp)", "", url, sizeof(url))) { free(tn); break; }
+                char *tu = str_dup_trim(url);
+                if (!tu[0]) { free(tn); free(tu); tui_alert("URL is required."); break; }
+                tui_prompt("Auth Header (Bearer xxx or empty)", "", auth, sizeof(auth));
+                char *ta = str_dup_trim(auth);
+                char out_id[64];
+                if (mcp_add(tn, tu, ta, out_id, sizeof(out_id)) != 0) {
+                    tui_alert("Failed to add server (limit reached).");
+                } else {
+                    char err[512] = {0};
+                    int rc = mcp_connect_one(out_id, err, sizeof(err));
+                    if (rc != 0) {
+                        char *msg = xasprintf("Added but connect failed: %s", err[0] ? err : "unknown");
+                        tui_alert(msg);
+                        free(msg);
+                    } else {
+                        tui_alert("MCP server added and connected.");
+                    }
+                    sel = mcp_server_count() - 1;
+                }
+                free(tn); free(tu); free(ta);
+                break;
+            }
+            case 'd': case 'D': {
+                if (n == 0) break;
+                const mcp_server_t *srv = mcp_get_server(sel);
+                if (!srv) break;
+                char *msg = xasprintf("Remove MCP server '%s'?", srv->name);
+                bool ok = tui_confirm(msg);
+                free(msg);
+                if (ok) {
+                    mcp_remove(srv->id);
+                    if (sel >= mcp_server_count()) sel = mcp_server_count() - 1;
+                    if (sel < 0) sel = 0;
+                }
+                break;
+            }
+            case 'r': case 'R': {
+                if (n == 0) break;
+                const mcp_server_t *srv = mcp_get_server(sel);
+                if (!srv) break;
+                char err[512] = {0};
+                int rc = mcp_connect_one(srv->id, err, sizeof(err));
+                if (rc == 0) tui_alert("Reconnected successfully.");
+                else { char *msg = xasprintf("Reconnect failed: %s", err[0] ? err : "unknown"); tui_alert(msg); free(msg); }
+                break;
+            }
+            default: break;
+        }
+    }
+}
+
 static void settings_item(int idx, const char *label, const char *value, bool active) {
     int x = 4;
     if (active) wattron(w_main, A_REVERSE);
@@ -1427,8 +1612,8 @@ static void settings_item(int idx, const char *label, const char *value, bool ac
 }
 
 static void screen_settings_draw(void) {
-    const char *items[15];
-    char vals[15][2048];
+    const char *items[16];
+    char vals[16][2048];
     items[0] = "Provider";
     snprintf(vals[0], sizeof(vals[0]), "%s", g_cfg.provider);
     items[1] = "API Key (current)";
@@ -1464,10 +1649,19 @@ static void screen_settings_draw(void) {
         for (int i = 0; all[i]; i++) { total++; if (config_has_key_for(all[i]->id)) configured++; }
         snprintf(vals[14], sizeof(vals[14]), "%d/%d configured", configured, total);
     }
+    items[15] = "MCP Servers (tools)";
+    {
+        int tc = mcp_tool_count();
+        int sc = mcp_connected_count();
+        int total = mcp_server_count();
+        if (tc > 0) snprintf(vals[15], sizeof(vals[15]), "%d tool(s) from %d/%d server(s)", tc, sc, total);
+        else if (total > 0) snprintf(vals[15], sizeof(vals[15]), "%d server(s) disconnected", total);
+        else snprintf(vals[15], sizeof(vals[15]), "(none)");
+    }
 
     werase(w_main);
     mvwprintw(w_main, 0, 2, "Configuration (mirrors the web app settings)");
-    for (int i = 0; i < 15; i++) {
+    for (int i = 0; i < 16; i++) {
         settings_item(i, items[i], vals[i], i == g_settings_sel);
     }
     mvwprintw(w_main, getmaxy(w_main) - 1, 2, "Up/Down: move   Enter: edit   F1: help   Esc: back");
@@ -1475,7 +1669,7 @@ static void screen_settings_draw(void) {
 
 static void screen_settings_key(int ch) {
     if (ch == KEY_UP && g_settings_sel > 0) g_settings_sel--;
-    else if (ch == KEY_DOWN && g_settings_sel < 14) g_settings_sel++;
+    else if (ch == KEY_DOWN && g_settings_sel < 15) g_settings_sel++;
     else if (ch == 27) g_screen = SCREEN_CHAT;
     else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
         switch (g_settings_sel) {
@@ -1697,6 +1891,7 @@ static void screen_settings_key(int ch) {
             }
             case 13: multi_free(); break;
             case 14: settings_manage_api_keys(); fetch_models(); break;
+            case 15: mcp_manage_dialog(); break;
         }
     }
 }
@@ -1736,7 +1931,10 @@ static void screen_help(void) {
         "  Tab switch focus | In file list: Up/Down select, Enter open, PgUp/PgDn switch tabs",
         "  x delete file | Space in agent input sends to AI coding agent.",
         "Settings:",
-        "  Up/Down move | Enter edit | F1 help",
+        "  Up/Down move | Enter edit | F1 help | 16:MCP Servers",
+        "MCP:",
+        "  Settings -> MCP Servers: a:add r:reconnect d:delete",
+        "  Chat shows MCP badge in status bar; agent uses tools when ready",
         "",
         "Press any key to close",
     };
@@ -1790,12 +1988,16 @@ static void draw_status(void) {
         model = g_cfg.selected_model[0] ? g_cfg.selected_model : "no model";
     }
     const char *vim = g_vim_mode ? (g_vim_insert ? "[VIM-INSERT]" : "[VIM]") : "";
+    char mcp_badge[64] = "";
+    int tc = mcp_tool_count();
+    int sc = mcp_connected_count();
+    if (tc > 0) snprintf(mcp_badge, sizeof(mcp_badge), " MCP:%d/%d", tc, sc);
     if (g_streaming) {
-        snprintf(line, sizeof(line), " %s | %.90s | Streaming | Tokens: %d (~%.4f USD) %s ",
-                 g_cfg.provider, model, g_last_tokens, g_last_cost, vim);
+        snprintf(line, sizeof(line), " %s | %.90s | Streaming | Tokens: %d (~%.4f USD)%s %s ",
+                 g_cfg.provider, model, g_last_tokens, g_last_cost, mcp_badge, vim);
     } else {
-        snprintf(line, sizeof(line), " %s | %.90s | Tokens: %d (~%.4f USD) %s ",
-                 g_cfg.provider, model, g_last_tokens, g_last_cost, vim);
+        snprintf(line, sizeof(line), " %s | %.90s | Tokens: %d (~%.4f USD)%s %s ",
+                 g_cfg.provider, model, g_last_tokens, g_last_cost, mcp_badge, vim);
     }
     wattrset(w_status, COLOR_PAIR(MD_DIM));
     mvwprintw(w_status, 0, 0, "%.*s", COLS, line);
@@ -2670,6 +2872,7 @@ void app_run(void) {
     /* state init */
     storage_init();
     config_load();
+    mcp_load();
     g_vim_mode = !strcmp(storage_get("gem_vim_mode"), "1");
     chat_load(&g_chat);
     notes_load(&g_notes);
@@ -2694,6 +2897,7 @@ void app_run(void) {
     ed_init(&g_note_editor);
     ed_init(&g_ide_editor);
 
+    mcp_connect_all();
     fetch_models();
 
     session_t *s = chat_current(&g_chat);
