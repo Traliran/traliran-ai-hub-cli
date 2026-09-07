@@ -34,4 +34,10 @@ const char *config_api_key(void);
 bool        config_has_key(void);       /* true when a key is expected but missing */
 bool        config_key_required(void);
 
+/* per-provider helpers for cross-provider multi-model */
+void   config_get_key_for(const char *provider, char *out, size_t outsz);
+void   config_get_endpoint_for(const char *provider, char *out, size_t outsz);
+bool   config_has_key_for(const char *provider);
+void   config_switch_provider(const char *new_provider); /* preserves old provider's key/endpoint/model and restores new provider's */
+
 #endif /* HUB_CONFIG_H */

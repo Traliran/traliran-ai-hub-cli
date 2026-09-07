@@ -10,6 +10,10 @@
 #include "util.h"
 #include "http.h"
 
+#ifndef HUB_VERSION
+#define HUB_VERSION "2.0.0"
+#endif
+
 void http_global_init(void)    { curl_global_init(CURL_GLOBAL_DEFAULT); }
 void http_global_cleanup(void) { curl_global_cleanup(); }
 
@@ -73,7 +77,7 @@ static void setup_common(CURL *h, const char *url, const char *bearer,
     curl_easy_setopt(h, CURLOPT_URL, url);
     curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 20L);
-    curl_easy_setopt(h, CURLOPT_USERAGENT, "traliran-ai-hub-cli/1.0");
+    curl_easy_setopt(h, CURLOPT_USERAGENT, "traliran-ai-hub-cli/" HUB_VERSION);
 }
 
 static http_res_t *run_post(const char *url, const char *bearer,
@@ -108,9 +112,13 @@ static http_res_t *run_post(const char *url, const char *bearer,
 }
 
 http_res_t *http_get(const char *url, const char *bearer) {
+    return http_get_ex(url, bearer, NULL);
+}
+
+http_res_t *http_get_ex(const char *url, const char *bearer, const char *x_api_key) {
     CURL *h = curl_easy_init();
     if (!h) return NULL;
-    setup_common(h, url, bearer, NULL);
+    setup_common(h, url, bearer, x_api_key);
     curl_easy_setopt(h, CURLOPT_HTTPGET, 1L);
 
     struct mem m = {0};

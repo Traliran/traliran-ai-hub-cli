@@ -53,7 +53,7 @@ void storage_save(void) {
 
 const char *storage_get(const char *key) {
     pthread_mutex_lock(&g_lock);
-    static char tmp[65536];
+    static __thread char tmp[65536];
     tmp[0] = '\0';
     if (g_store) {
         cJSON *item = cJSON_GetObjectItem(g_store, key);

@@ -60,7 +60,7 @@ All data stays local — no cloud sync, serverless & privacy-first.
 
 ## 🛡️ 100% Privacy-First & Serverless
 * **Zero Middleman Servers:** This is a 100% client-side application.
-* **Direct Routing:** Your API tokens are saved strictly in your local config (`~/.cache/traliran-cache/hub-config.json`) and sent straight to the official AI providers. No logs, no data collection, no leaks.
+* **Direct Routing:** Your API tokens are saved strictly in your local config (`~/.cache/traliran-cache/storage.json`) and sent straight to the official AI providers. No logs, no data collection, no leaks.
 * **AGPLv3 Guaranteed:** Total freedom to audit, inspect, and host the code yourself, backed by a strong copyleft license that keeps the project forever open.
 
 ---
@@ -82,6 +82,7 @@ All data stays local — no cloud sync, serverless & privacy-first.
 *   **🏪 Assistant Store:** Access a marketplace of free and premium, highly-optimized AI assistant presets and custom prompts for various tasks (e.g., Polyglot Translator, Code & Text Editor, Ideation Generator).
 *   **⚙️ Advanced Parameters Control:** Fine-tune system behaviors with on-the-fly adjustable Temperature, Top P, and Max Tokens configuration.
 *   **🌍 Full UTF-8 Input:** Type Cyrillic and other non-ASCII text everywhere (chat, notes, IDE, dialogs) with proper cursor handling.
+*   **🧩 MCP (Model Context Protocol):** Connect remote MCP servers over Streamable HTTP and expose their tools to the AI as function-calling tools — just like an IDE agent. The model decides when to call a tool, the hub proxies the call, feeds the result back, and repeats. Works with any Streamable HTTP MCP endpoint; configure servers in the **🧩 MCP Servers** modal.
 
 ---
 

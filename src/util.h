@@ -44,6 +44,8 @@ char  *format_usd(double value);
 char  *format_ts(long long ms);         /* "YYYY-MM-DD HH:MM" */
 long long now_ms(void);
 
+#define HUB_VERSION "2.0.0"
+
 /* data directories: ~/.cache/traliran-cache */
 const char *hub_dir(void);
 const char *hub_workspace_dir(void);    /* ~/.cache/traliran-cache/workspace - IDE VFS on disk */

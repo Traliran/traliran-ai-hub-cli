@@ -24,6 +24,7 @@
 #include "rag.h"
 #include "ide.h"
 #include "sandbox.h"
+#include "mcp.h"
 #include "app.h"
 
 #ifndef KEY_CTRL
@@ -53,8 +54,10 @@ static char g_attach_name[512];
 static char *g_attach_content;
 
 static char **g_models;
+static char **g_model_providers; /* parallel to g_models: provider id per model */
 static int g_nmodels;
 static char **g_multi;
+static char **g_multi_providers; /* parallel to g_multi: provider id per entry */
 static int g_nmulti;
 
 static int g_last_tokens;
@@ -99,6 +102,9 @@ static bool g_vim_insert;
 
 static WINDOW *w_tabbar, *w_status, *w_main;
 
+/* display row for grouped provider/model lists */
+typedef struct { int kind; /*0 header,1 model,2 hint*/ int model_idx; const char *provider; } disp_row_t;
+
 /* =================== layout =================== */
 
 #define TAB_H 1
@@ -132,43 +138,99 @@ static void run_job_ui(void) {
 /* =================== model fetching =================== */
 
 static void models_free(void) {
-    for (int i = 0; i < g_nmodels; i++) free(g_models[i]);
+    for (int i = 0; i < g_nmodels; i++) {
+        free(g_models[i]);
+        free(g_model_providers[i]);
+    }
     free(g_models);
+    free(g_model_providers);
     g_models = NULL;
+    g_model_providers = NULL;
     g_nmodels = 0;
 }
 
 static void multi_free(void) {
-    for (int i = 0; i < g_nmulti; i++) free(g_multi[i]);
+    for (int i = 0; i < g_nmulti; i++) {
+        free(g_multi[i]);
+        free(g_multi_providers[i]);
+    }
     free(g_multi);
+    free(g_multi_providers);
     g_multi = NULL;
+    g_multi_providers = NULL;
     g_nmulti = 0;
 }
 
-static void fetch_models(void) {
-    models_free();
-    const provider_t *pr = providers_get(g_cfg.provider);
-    if (!strcmp(g_cfg.provider, "claude")) {
-        static const char *fallback[] = {
-            "claude-3-5-sonnet-latest", "claude-3-7-sonnet-latest", "claude-3-5-haiku-latest"
-        };
-        g_models = calloc(3, sizeof(char *));
-        for (int i = 0; i < 3; i++) g_models[g_nmodels++] = xstrdup(fallback[i]);
-        if (!g_cfg.selected_model[0]) {
-            snprintf(g_cfg.selected_model, sizeof(g_cfg.selected_model), "%s", g_models[0]);
-        }
+static void cache_save_provider(const char *pid, char **models, int n) {
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < n; i++) cJSON_AddItemToArray(arr, cJSON_CreateString(models[i]));
+    char *json = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
+    if (json) {
+        char keyname[128];
+        snprintf(keyname, sizeof(keyname), "gem_models_%s", pid);
+        storage_set(keyname, json);
+        storage_save();
+        free(json);
+    }
+}
+
+static bool cache_load_provider(const char *pid) {
+    char keyname[128];
+    snprintf(keyname, sizeof(keyname), "gem_models_%s", pid);
+    char *copy = xstrdup(storage_get(keyname));
+    if (!copy || !copy[0]) { free(copy); return false; }
+    cJSON *arr = cJSON_Parse(copy);
+    free(copy);
+    if (!arr || !cJSON_IsArray(arr)) { if (arr) cJSON_Delete(arr); return false; }
+    int n = cJSON_GetArraySize(arr);
+    bool added = false;
+    for (int i = 0; i < n; i++) {
+        cJSON *it = cJSON_GetArrayItem(arr, i);
+        if (!it || !cJSON_IsString(it) || !it->valuestring) continue;
+        g_models = realloc(g_models, sizeof(char *) * (size_t)(g_nmodels + 1));
+        g_model_providers = realloc(g_model_providers, sizeof(char *) * (size_t)(g_nmodels + 1));
+        g_models[g_nmodels] = xstrdup(it->valuestring);
+        g_model_providers[g_nmodels] = xstrdup(pid);
+        g_nmodels++;
+        added = true;
+    }
+    cJSON_Delete(arr);
+    return added;
+}
+
+static void fetch_models_for_provider(const char *pid) {
+    char key[2048], endpoint[2048];
+    config_get_key_for(pid, key, sizeof(key));
+    config_get_endpoint_for(pid, endpoint, sizeof(endpoint));
+    const provider_t *pr = providers_get(pid);
+    if (!pr) return;
+
+    /* if key is missing - don't go to network, try cache, otherwise leave section empty and show hint */
+    if (pr->has_key && !key[0]) {
+        cache_load_provider(pid);
         return;
     }
-    if (pr->has_key && !g_cfg.api_key[0]) return;
 
-    char url[2048];
-    snprintf(url, sizeof(url), "%s/models", config_endpoint());
-    http_res_t *r = http_get(url, g_cfg.api_key);
+    /* also try local providers, but on failure fall back to cache */
+    char url[4096];
+    snprintf(url, sizeof(url), "%s/models", endpoint);
+    http_res_t *r = NULL;
+    if (!strcmp(pr->type, "anthropic")) {
+        r = http_get_ex(url, NULL, key);
+    } else {
+        r = http_get_ex(url, key, NULL);
+    }
     if (!r || !r->ok) {
         if (r) http_res_free(r);
+        /* network failed - try to show cached models if any */
+        cache_load_provider(pid);
         return;
     }
     cJSON *j = cJSON_Parse(r->body);
+    /* collect models into temporary list for cache */
+    char **tmp = NULL;
+    int ntmp = 0, cap = 0;
     if (j) {
         cJSON *data = cJSON_GetObjectItem(j, "data");
         cJSON *arr = data && cJSON_IsArray(data) ? data : (cJSON_IsArray(j) ? j : NULL);
@@ -187,22 +249,58 @@ static void fetch_models(void) {
                 if (strstr(lower, "whisper") || strstr(lower, "tts") ||
                     strstr(lower, "embed") || strstr(lower, "guard"))
                     continue;
-                g_models = realloc(g_models, sizeof(char *) * (size_t)(g_nmodels + 1));
-                g_models[g_nmodels++] = xstrdup(mid);
+                if (ntmp >= cap) { cap = cap ? cap * 2 : 32; tmp = realloc(tmp, sizeof(char*) * (size_t)cap); }
+                tmp[ntmp++] = xstrdup(mid);
             }
         }
         cJSON_Delete(j);
     }
     http_res_free(r);
+    if (ntmp == 0) {
+        free(tmp);
+        cache_load_provider(pid);
+        return;
+    }
+    /* save to cache and append to global list */
+    cache_save_provider(pid, tmp, ntmp);
+    for (int i = 0; i < ntmp; i++) {
+        g_models = realloc(g_models, sizeof(char *) * (size_t)(g_nmodels + 1));
+        g_model_providers = realloc(g_model_providers, sizeof(char *) * (size_t)(g_nmodels + 1));
+        g_models[g_nmodels] = tmp[i]; /* ownership transfer */
+        g_model_providers[g_nmodels] = xstrdup(pid);
+        g_nmodels++;
+    }
+    free(tmp);
+}
 
+static void fetch_models(void) {
+    models_free();
+    /* gather models from all providers that have a key (or are local) */
+    const provider_t **all = providers_all();
+    for (int i = 0; all[i]; i++) fetch_models_for_provider(all[i]->id);
+    /* fallback: if nothing collected, try current provider alone (legacy) */
+    if (g_nmodels == 0) fetch_models_for_provider(g_cfg.provider);
     if (g_nmodels > 0 && !g_cfg.selected_model[0]) {
-        snprintf(g_cfg.selected_model, sizeof(g_cfg.selected_model), "%s", g_models[0]);
+        /* pick first model belonging to current provider, else first overall */
+        const char *pick = NULL;
+        for (int i = 0; i < g_nmodels; i++)
+            if (!strcmp(g_model_providers[i], g_cfg.provider)) { pick = g_models[i]; break; }
+        if (!pick) pick = g_models[0];
+        snprintf(g_cfg.selected_model, sizeof(g_cfg.selected_model), "%s", pick);
     }
     if (g_nmodels > 0 && g_cfg.selected_model[0]) {
         bool found = false;
         for (int i = 0; i < g_nmodels; i++)
-            if (!strcmp(g_models[i], g_cfg.selected_model)) { found = true; break; }
-        if (!found) snprintf(g_cfg.selected_model, sizeof(g_cfg.selected_model), "%s", g_models[0]);
+            if (!strcmp(g_models[i], g_cfg.selected_model) && !strcmp(g_model_providers[i], g_cfg.provider)) { found = true; break; }
+        if (!found) {
+            /* keep selected_model if it exists anywhere, otherwise reset to provider's first */
+            bool any = false;
+            for (int i = 0; i < g_nmodels; i++) if (!strcmp(g_models[i], g_cfg.selected_model)) { any = true; break; }
+            if (!any) {
+                for (int i = 0; i < g_nmodels; i++)
+                    if (!strcmp(g_model_providers[i], g_cfg.provider)) { snprintf(g_cfg.selected_model, sizeof(g_cfg.selected_model), "%s", g_models[i]); break; }
+            }
+        }
     }
 }
 
@@ -276,6 +374,56 @@ static bool chat_validate(void) {
 }
 
 static void chat_send_single(session_t *s, const char *model) {
+    /* MCP agentic path: single-model + MCP ready */
+    if (chat_mcp_should_use(g_nmulti)) {
+        mcp_send_arg_t *ma = calloc(1, sizeof(*ma));
+        ma->session = s;
+        ma->model = xstrdup(model);
+        stream_init(&ma->stream);
+        ma->progress = &g_progress;
+        g_active_stream = &ma->stream;
+        g_job_stop = 0;
+        progress_set(&g_progress, "MCP agent starting...");
+        job_start(&g_job, mcp_send_worker, ma);
+        run_job_ui();
+        job_join(&g_job);
+        g_active_stream = NULL;
+        progress_set(&g_progress, "");
+
+        stream_t *st = &ma->stream;
+        if (st->error) {
+            char *err = xasprintf("Execution Interrupted: %s", st->error);
+            chat_msg_push(s, "assistant", err);
+            free(err);
+        } else if (st->stop) {
+            chat_msg_push(s, "assistant", "_Generation stopped by user._");
+        } else {
+            char *content = stream_snapshot_content(st);
+            char *reasoning = stream_snapshot_reasoning(st);
+            char *final;
+            if (reasoning && reasoning[0])
+                final = xasprintf(" thinking%s response\n%s", reasoning, content);
+            else
+                final = xstrdup(content);
+            if (!final[0]) { free(final); final = xstrdup("(No response)"); }
+            chat_msg_push(s, "assistant", final);
+            free(content);
+            free(reasoning);
+            free(final);
+            if (s->n >= 2) {
+                g_last_tokens = (int)estimate_tokens(s->messages[s->n - 2].content) +
+                                (int)estimate_tokens(s->messages[s->n - 1].content);
+                g_last_cost = (g_last_tokens / 1000.0) * 0.03;
+            }
+        }
+        chat_save(&g_chat);
+        chat_rebuild_view(true);
+        stream_free(st);
+        free(ma->model);
+        free(ma);
+        return;
+    }
+
     send_arg_t *a = calloc(1, sizeof(*a));
     a->session = s;
     a->model = xstrdup(model);
@@ -337,6 +485,7 @@ static void chat_send_multi(session_t *s) {
 
     mm_arg_t *all = calloc(1, sizeof(*all));
     all->models = calloc((size_t)g_nmulti, sizeof(char *));
+    all->providers = calloc((size_t)g_nmulti, sizeof(char *));
     all->nmodels = g_nmulti;
     all->messages_json = msgs;
     all->temperature = g_cfg.temperature;
@@ -345,7 +494,9 @@ static void chat_send_multi(session_t *s) {
     all->results = calloc((size_t)g_nmulti, sizeof(mm_result_t));
     for (int i = 0; i < g_nmulti; i++) {
         all->models[i] = xstrdup(g_multi[i]);
+        all->providers[i] = xstrdup(g_multi_providers[i] ? g_multi_providers[i] : g_cfg.provider);
         all->results[i].model = xstrdup(g_multi[i]);
+        all->results[i].provider = xstrdup(g_multi_providers[i] ? g_multi_providers[i] : g_cfg.provider);
     }
     g_active_mm = all;
     g_job_stop = 0;
@@ -359,7 +510,8 @@ static void chat_send_multi(session_t *s) {
     sbuf_append(&md, "### Multi-Model Performance Comparison\n\n");
     for (int i = 0; i < all->nmodels; i++) {
         mm_result_t *r = &all->results[i];
-        sbuf_appendf(&md, "#### Model: `%s`\n\n", r->model);
+        const char *prov = r->provider && r->provider[0] ? r->provider : (all->providers[i] ? all->providers[i] : g_cfg.provider);
+        sbuf_appendf(&md, "#### Model: `%s` (provider: `%s`)\n\n", r->model, prov);
         if (r->err) {
             sbuf_appendf(&md, "Error: `%s`\n\n---\n", r->errmsg ? r->errmsg : "API error");
         } else {
@@ -371,6 +523,7 @@ static void chat_send_multi(session_t *s) {
         api_result_free(&r->res);
         free(r->errmsg);
         free(r->model);
+        free(r->provider);
     }
     chat_msg_push(s, "assistant", md.s);
     g_last_tokens = (int)estimate_tokens(msgs) + (int)estimate_tokens(md.s);
@@ -378,8 +531,12 @@ static void chat_send_multi(session_t *s) {
     sbuf_free(&md);
 
     free(msgs);
-    for (int i = 0; i < all->nmodels; i++) free(all->models[i]);
+    for (int i = 0; i < all->nmodels; i++) {
+        free(all->models[i]);
+        free(all->providers[i]);
+    }
     free(all->models);
+    free(all->providers);
     free(all->results);
     free(all);
 
@@ -589,58 +746,137 @@ static void chat_sandbox_last(void) {
 /* =================== multi-model dialog =================== */
 
 static void multi_model_dialog(void) {
-    if (g_nmodels == 0) {
-        tui_alert("Please fetch models first (Settings -> Fetch Models).");
+    /* build grouped display by provider; show hint when key is missing */
+    const provider_t **all = providers_all();
+    int nprov = 0; while (all[nprov]) nprov++;
+
+    /* number of display rows: header per provider + models + hint if no models */
+    int disp_cap = nprov * 2 + g_nmodels + 10;
+    disp_row_t *disp = malloc(sizeof(disp_row_t) * (size_t)disp_cap);
+    int disp_n = 0;
+    for (int p = 0; p < nprov; p++) {
+        const char *pid = all[p]->id;
+        disp[disp_n++] = (disp_row_t){0, -1, pid};
+        int cnt = 0;
+        for (int i = 0; i < g_nmodels; i++) if (g_model_providers[i] && !strcmp(g_model_providers[i], pid)) cnt++;
+        if (cnt == 0) {
+            /* no models for this provider - show hint (missing key or empty cache/network error) */
+            disp[disp_n++] = (disp_row_t){2, -1, pid};
+        } else {
+            for (int i = 0; i < g_nmodels; i++) if (g_model_providers[i] && !strcmp(g_model_providers[i], pid)) {
+                disp[disp_n++] = (disp_row_t){1, i, pid};
+            }
+        }
+    }
+
+    if (disp_n == 0) {
+        tui_alert("No providers");
+        free(disp);
         return;
     }
-    int h = LINES - 8, w = 56;
-    if (h > g_nmodels + 4) h = g_nmodels + 4;
+
+    int h = LINES - 8, w = 74;
+    if (w > COLS - 4) w = COLS - 4;
+    if (h > disp_n + 6) h = disp_n + 6;
+    if (h > LINES - 4) h = LINES - 4;
+    if (h < 10) h = 10;
     int y0 = (LINES - h) / 2, x0 = (COLS - w) / 2;
     WINDOW *win = tui_win(h, w, y0, x0);
     WINDOW *list = tui_win(h - 4, w - 2, y0 + 2, x0 + 1);
-    tui_box(win, "Parallel Mode - Multi-Model Selection");
+    tui_box(win, "Parallel Mode - Multi-Model Selection (cross-provider)");
 
-    bool *checked = calloc((size_t)g_nmodels, sizeof(bool));
-    for (int i = 0; i < g_nmodels; i++)
-        for (int k = 0; k < g_nmulti; k++)
-            if (!strcmp(g_models[i], g_multi[k])) { checked[i] = true; break; }
+    bool *checked = calloc((size_t)(g_nmodels ? g_nmodels : 1), sizeof(bool));
+    for (int i = 0; i < g_nmodels; i++) {
+        for (int k = 0; k < g_nmulti; k++) {
+            const char *mp = g_multi_providers[k] ? g_multi_providers[k] : "";
+            const char *gp = g_model_providers[i] ? g_model_providers[i] : "";
+            if (!strcmp(g_models[i], g_multi[k]) && !strcmp(gp, mp)) { checked[i] = true; break; }
+        }
+    }
 
-    int sel = 0;
+    int sel_disp = -1;
+    for (int i = 0; i < disp_n; i++) if (disp[i].kind == 1) { sel_disp = i; break; }
+    if (sel_disp < 0) sel_disp = 0;
+
     bool done = false;
     while (!done) {
         werase(list);
         int lh = getmaxy(list);
-        int top = sel - lh / 2;
+        int top = sel_disp - lh / 2;
         if (top < 0) top = 0;
-        for (int i = 0; i < lh && top + i < g_nmodels; i++) {
+        if (top + lh > disp_n) top = disp_n - lh;
+        if (top < 0) top = 0;
+        for (int i = 0; i < lh && top + i < disp_n; i++) {
             int idx = top + i;
-            if (idx == sel) wattron(list, A_REVERSE);
-            mvwprintw(list, i, 0, "[%c] %s", checked[idx] ? 'X' : ' ', g_models[idx]);
-            if (idx == sel) wattroff(list, A_REVERSE);
+            disp_row_t *r = &disp[idx];
+            bool is_sel = (idx == sel_disp);
+            if (r->kind == 0) {
+                wattron(list, COLOR_PAIR(MD_HEADING) | A_BOLD);
+                mvwprintw(list, i, 0, "─ %s ─", r->provider);
+                wattroff(list, COLOR_PAIR(MD_HEADING) | A_BOLD);
+            } else if (r->kind == 2) {
+                const provider_t *pr = providers_find(r->provider);
+                bool need_key = pr && pr->has_key && !config_has_key_for(r->provider);
+                if (need_key) {
+                    wattron(list, COLOR_PAIR(MD_WARN));
+                    mvwprintw(list, i, 0, "  [!] Insert API key in Settings (5) -> %s", r->provider);
+                    wattroff(list, COLOR_PAIR(MD_WARN));
+                } else {
+                    wattron(list, COLOR_PAIR(MD_DIM));
+                    mvwprintw(list, i, 0, "  (no models: press Fetch Models in Settings or check network)");
+                    wattroff(list, COLOR_PAIR(MD_DIM));
+                }
+            } else {
+                int mi = r->model_idx;
+                bool ck = checked[mi];
+                if (is_sel) wattron(list, A_REVERSE);
+                if (ck) wattron(list, COLOR_PAIR(MD_GREEN) | A_BOLD);
+                char label[512];
+                snprintf(label, sizeof(label), "[%c] %s", ck ? 'X' : ' ', g_models[mi]);
+                mvwprintw(list, i, 0, "%.*s", w - 4, label);
+                if (ck) wattroff(list, COLOR_PAIR(MD_GREEN) | A_BOLD);
+                if (is_sel) wattroff(list, A_REVERSE);
+            }
         }
         wattrset(win, 0);
-        mvwprintw(win, h - 2, 2, "Space: toggle   Enter: run   [c]: clear   Esc: cancel");
+        int sel_cnt = 0; for (int i=0;i<g_nmodels;i++) if (checked[i]) sel_cnt++;
+        mvwprintw(win, h - 2, 2, "Space/Enter: toggle  [c]: clear  [a]: select all  Esc: save & close (%d selected)", sel_cnt);
+        mvwprintw(win, h - 1, 2, "Menu stays open until Esc — select models to compare (%d cached)", g_nmodels);
         wrefresh(list);
         wrefresh(win);
         int ch = getch();
-        if (ch == 27) done = true;
-        else if (ch == KEY_UP && sel > 0) sel--;
-        else if (ch == KEY_DOWN && sel < g_nmodels - 1) sel++;
-        else if (ch == ' ') checked[sel] = !checked[sel];
-        else if (ch == 'c' || ch == 'C') {
-            for (int i = 0; i < g_nmodels; i++) checked[i] = false;
-        } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+        if (ch == 27) {
             multi_free();
             for (int i = 0; i < g_nmodels; i++)
                 if (checked[i]) {
                     g_multi = realloc(g_multi, sizeof(char *) * (size_t)(g_nmulti + 1));
-                    g_multi[g_nmulti++] = xstrdup(g_models[i]);
+                    g_multi_providers = realloc(g_multi_providers, sizeof(char *) * (size_t)(g_nmulti + 1));
+                    g_multi[g_nmulti] = xstrdup(g_models[i]);
+                    g_multi_providers[g_nmulti] = xstrdup(g_model_providers[i] ? g_model_providers[i] : g_cfg.provider);
+                    g_nmulti++;
                 }
             done = true;
+        } else if (ch == KEY_UP) {
+            int cur = sel_disp - 1;
+            while (cur >= 0 && disp[cur].kind != 1) cur--;
+            if (cur >= 0) sel_disp = cur;
+        } else if (ch == KEY_DOWN) {
+            int cur = sel_disp + 1;
+            while (cur < disp_n && disp[cur].kind != 1) cur++;
+            if (cur < disp_n) sel_disp = cur;
+        } else if (ch == ' ') {
+            if (disp[sel_disp].kind == 1) checked[disp[sel_disp].model_idx] = !checked[disp[sel_disp].model_idx];
+        } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+            if (disp[sel_disp].kind == 1) checked[disp[sel_disp].model_idx] = !checked[disp[sel_disp].model_idx];
+        } else if (ch == 'c' || ch == 'C') {
+            for (int i = 0; i < g_nmodels; i++) checked[i] = false;
+        } else if (ch == 'a' || ch == 'A') {
+            for (int i = 0; i < g_nmodels; i++) checked[i] = true;
         }
     }
     delwin(list);
     delwin(win);
+    free(disp);
     free(checked);
 }
 
@@ -1124,14 +1360,244 @@ static void settings_select_provider(void) {
         else if (ch == KEY_UP && sel > 0) sel--;
         else if (ch == KEY_DOWN && sel < count - 1) sel++;
         else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
-            snprintf(g_cfg.provider, sizeof(g_cfg.provider), "%s", all[sel]->id);
-            if (!g_cfg.endpoint[0]) snprintf(g_cfg.endpoint, sizeof(g_cfg.endpoint), "%s", all[sel]->url);
-            config_save();
+            config_switch_provider(all[sel]->id);
             done = true;
         }
     }
     delwin(list);
     delwin(win);
+}
+
+static void settings_manage_api_keys(void) {
+    const provider_t **all = providers_all();
+    int count = 0; while (all[count]) count++;
+    int h = count + 6, w = 78;
+    if (w > COLS - 4) w = COLS - 4;
+    if (h > LINES - 4) h = LINES - 4;
+    if (h < 10) h = 10;
+    int y0 = (LINES - h) / 2, x0 = (COLS - w) / 2;
+    WINDOW *win = tui_win(h, w, y0, x0);
+    WINDOW *list = tui_win(h - 4, w - 2, y0 + 2, x0 + 1);
+    tui_box(win, "API Keys - Multi-Provider Management (for comparison & quick switch)");
+    int sel = 0;
+    bool done = false;
+    while (!done) {
+        werase(list);
+        for (int i = 0; i < count; i++) {
+            const char *pid = all[i]->id;
+            char keybuf[2048];
+            config_get_key_for(pid, keybuf, sizeof(keybuf));
+            char epbuf[1024];
+            config_get_endpoint_for(pid, epbuf, sizeof(epbuf));
+            bool has = config_has_key_for(pid);
+            bool is_active = !strcmp(pid, g_cfg.provider);
+            const char *status = has ? (all[i]->has_key ? "**** (set)" : "(no key required)") : "(not set)";
+            if (i == sel) wattron(list, A_REVERSE);
+            else if (has && all[i]->has_key) wattron(list, COLOR_PAIR(MD_GREEN));
+            else if (!has) wattron(list, COLOR_PAIR(MD_WARN));
+            char line[2048];
+            snprintf(line, sizeof(line), "%-12s %-20s  %s%s", pid, status, epbuf, is_active ? "  [active]" : "");
+            mvwprintw(list, i, 0, "%.*s", w - 4, line);
+            if (i == sel) wattroff(list, A_REVERSE);
+            else if (has && all[i]->has_key) wattroff(list, COLOR_PAIR(MD_GREEN));
+            else if (!has) wattroff(list, COLOR_PAIR(MD_WARN));
+        }
+        int configured2 = 0; for (int i = 0; i < count; i++) if (config_has_key_for(all[i]->id)) configured2++;
+        mvwprintw(win, h - 2, 2, "Enter: edit key  e: endpoint  d: delete  p: set active  F: fetch  Esc: back (%d/%d set)", configured2, count);
+        mvwprintw(win, h - 1, 2, "Keys stored locally — quick switch with 'p', compare with F7 in Chat");
+        wrefresh(list);
+        wrefresh(win);
+        int ch = getch();
+        if (ch == 27) done = true;
+        else if (ch == KEY_UP && sel > 0) sel--;
+        else if (ch == KEY_DOWN && sel < count - 1) sel++;
+        else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+            char cur[2048];
+            config_get_key_for(all[sel]->id, cur, sizeof(cur));
+            char v[2048];
+            char title[128];
+            snprintf(title, sizeof(title), "API Key for %s", all[sel]->id);
+            if (tui_prompt(title, cur, v, sizeof(v))) {
+                char *t = str_trim(v);
+                char keyname[128];
+                snprintf(keyname, sizeof(keyname), "gem_key_%s", all[sel]->id);
+                storage_set(keyname, t);
+                storage_save();
+                if (!strcmp(all[sel]->id, g_cfg.provider)) {
+                    snprintf(g_cfg.api_key, sizeof(g_cfg.api_key), "%s", t);
+                }
+                fetch_models();
+            }
+        } else if (ch == 'e' || ch == 'E') {
+            char cur[1024];
+            config_get_endpoint_for(all[sel]->id, cur, sizeof(cur));
+            char v[1024];
+            char title[128];
+            snprintf(title, sizeof(title), "Endpoint for %s", all[sel]->id);
+            if (tui_prompt(title, cur, v, sizeof(v))) {
+                char *t = str_trim(v);
+                char keyname[128];
+                snprintf(keyname, sizeof(keyname), "gem_endpoint_%s", all[sel]->id);
+                storage_set(keyname, t);
+                storage_save();
+                if (!strcmp(all[sel]->id, g_cfg.provider)) {
+                    snprintf(g_cfg.endpoint, sizeof(g_cfg.endpoint), "%s", t);
+                }
+            }
+        } else if (ch == 'd' || ch == 'D') {
+            char keyname[128];
+            snprintf(keyname, sizeof(keyname), "gem_key_%s", all[sel]->id);
+            storage_set(keyname, "");
+            storage_save();
+            if (!strcmp(all[sel]->id, g_cfg.provider)) g_cfg.api_key[0] = '\0';
+        } else if (ch == 'p' || ch == 'P') {
+            config_switch_provider(all[sel]->id);
+            char *msg = xasprintf("Active provider: %s", all[sel]->id);
+            tui_alert(msg);
+            free(msg);
+        } else if (ch == 'f' || ch == 'F') {
+            fetch_models();
+            char *msg = xasprintf("Updated: %d models", g_nmodels);
+            tui_alert(msg);
+            free(msg);
+        }
+    }
+    delwin(list);
+    delwin(win);
+}
+
+static void mcp_manage_dialog(void) {
+    int sel = 0;
+    bool done = false;
+    while (!done) {
+        int n = mcp_server_count();
+        int h = LINES - 6, w = COLS - 8;
+        if (h < 12) h = 12;
+        if (w < 60) w = 60;
+        if (w > COLS - 4) w = COLS - 4;
+        if (h > LINES - 4) h = LINES - 4;
+        int y0 = (LINES - h) / 2, x0 = (COLS - w) / 2;
+        WINDOW *win = tui_win(h, w, y0, x0);
+        WINDOW *list = tui_win(h - 4, w - 2, y0 + 2, x0 + 1);
+        char title[128];
+        int tc = mcp_tool_count();
+        int cc = mcp_connected_count();
+        if (tc > 0) snprintf(title, sizeof(title), "MCP Servers — %d tool(s) from %d server(s)", tc, cc);
+        else snprintf(title, sizeof(title), "MCP Servers — not connected");
+        tui_box(win, title);
+        werase(list);
+        if (n == 0) {
+            mvwprintw(list, 1, 0, "No MCP servers configured.");
+            mvwprintw(list, 2, 0, "Press 'a' to add a server.");
+            mvwprintw(list, 4, 0, "Example: Name=MyServer  URL=https://host/mcp  Auth=Bearer xxx");
+        } else {
+            for (int i = 0; i < n && i < h - 6; i++) {
+                const mcp_server_t *srv = mcp_get_server(i);
+                const mcp_client_t *cl = mcp_get_client(srv->id);
+                bool connected = cl && cl->connected;
+                int ntools = cl ? cl->ntools : 0;
+                if (i == sel) wattron(list, A_REVERSE);
+                else if (connected) wattron(list, COLOR_PAIR(MD_GREEN));
+                else wattron(list, COLOR_PAIR(MD_WARN));
+                char line[512];
+                if (connected) snprintf(line, sizeof(line), "%s  %s  (%d tools) %s", srv->name, srv->url, ntools, "connected");
+                else snprintf(line, sizeof(line), "%s  %s  %s", srv->name, srv->url, "disconnected");
+                mvwprintw(list, i, 0, "%.*s", w - 4, line);
+                if (i == sel) wattroff(list, A_REVERSE);
+                else if (connected) wattroff(list, COLOR_PAIR(MD_GREEN));
+                else wattroff(list, COLOR_PAIR(MD_WARN));
+                /* show tool names on next row if selected */
+                if (i == sel && connected && cl && ntools > 0) {
+                    wattron(list, COLOR_PAIR(MD_DIM));
+                    sbuf_t tb;
+                    sbuf_init(&tb);
+                    for (int t = 0; t < ntools && t < 8; t++) {
+                        if (t) sbuf_append(&tb, ", ");
+                        sbuf_append(&tb, cl->tools[t].name);
+                    }
+                    if (ntools > 8) sbuf_append(&tb, "...");
+                    mvwprintw(list, i + 1, 2, "tools: %.*s", w - 8, tb.s);
+                    sbuf_free(&tb);
+                    wattroff(list, COLOR_PAIR(MD_DIM));
+                }
+            }
+        }
+        mvwprintw(win, h - 2, 2, "a:add  r:reconnect  d:delete  Esc:back  (%d servers)", n);
+        if (n > 0) mvwprintw(win, h - 1, 2, "Up/Down: select  Enter: reconnect");
+        wrefresh(list);
+        wrefresh(win);
+        int ch = getch();
+        delwin(list);
+        delwin(win);
+        switch (ch) {
+            case 27: done = true; break;
+            case KEY_UP: if (sel > 0) sel--; break;
+            case KEY_DOWN: if (sel < n - 1) sel++; break;
+            case '\n': case '\r': case KEY_ENTER: {
+                if (n == 0) break;
+                const mcp_server_t *srv = mcp_get_server(sel);
+                if (!srv) break;
+                char err[512] = {0};
+                int rc = mcp_connect_one(srv->id, err, sizeof(err));
+                if (rc == 0) tui_alert("Reconnected successfully.");
+                else { char *msg = xasprintf("Failed to connect: %s", err[0] ? err : "unknown"); tui_alert(msg); free(msg); }
+                break;
+            }
+            case 'a': case 'A': {
+                char name[256] = {0}, url[1024] = {0}, auth[1024] = {0};
+                if (!tui_prompt("MCP Server Name", "", name, sizeof(name))) break;
+                char *tn = str_dup_trim(name);
+                if (!tn[0]) { free(tn); tui_alert("Name is required."); break; }
+                if (!tui_prompt("MCP Server URL (https://host/mcp)", "", url, sizeof(url))) { free(tn); break; }
+                char *tu = str_dup_trim(url);
+                if (!tu[0]) { free(tn); free(tu); tui_alert("URL is required."); break; }
+                tui_prompt("Auth Header (Bearer xxx or empty)", "", auth, sizeof(auth));
+                char *ta = str_dup_trim(auth);
+                char out_id[64];
+                if (mcp_add(tn, tu, ta, out_id, sizeof(out_id)) != 0) {
+                    tui_alert("Failed to add server (limit reached).");
+                } else {
+                    char err[512] = {0};
+                    int rc = mcp_connect_one(out_id, err, sizeof(err));
+                    if (rc != 0) {
+                        char *msg = xasprintf("Added but connect failed: %s", err[0] ? err : "unknown");
+                        tui_alert(msg);
+                        free(msg);
+                    } else {
+                        tui_alert("MCP server added and connected.");
+                    }
+                    sel = mcp_server_count() - 1;
+                }
+                free(tn); free(tu); free(ta);
+                break;
+            }
+            case 'd': case 'D': {
+                if (n == 0) break;
+                const mcp_server_t *srv = mcp_get_server(sel);
+                if (!srv) break;
+                char *msg = xasprintf("Remove MCP server '%s'?", srv->name);
+                bool ok = tui_confirm(msg);
+                free(msg);
+                if (ok) {
+                    mcp_remove(srv->id);
+                    if (sel >= mcp_server_count()) sel = mcp_server_count() - 1;
+                    if (sel < 0) sel = 0;
+                }
+                break;
+            }
+            case 'r': case 'R': {
+                if (n == 0) break;
+                const mcp_server_t *srv = mcp_get_server(sel);
+                if (!srv) break;
+                char err[512] = {0};
+                int rc = mcp_connect_one(srv->id, err, sizeof(err));
+                if (rc == 0) tui_alert("Reconnected successfully.");
+                else { char *msg = xasprintf("Reconnect failed: %s", err[0] ? err : "unknown"); tui_alert(msg); free(msg); }
+                break;
+            }
+            default: break;
+        }
+    }
 }
 
 static void settings_item(int idx, const char *label, const char *value, bool active) {
@@ -1146,11 +1612,11 @@ static void settings_item(int idx, const char *label, const char *value, bool ac
 }
 
 static void screen_settings_draw(void) {
-    const char *items[14];
-    char vals[14][2048];
+    const char *items[16];
+    char vals[16][2048];
     items[0] = "Provider";
     snprintf(vals[0], sizeof(vals[0]), "%s", g_cfg.provider);
-    items[1] = "API Key";
+    items[1] = "API Key (current)";
     snprintf(vals[1], sizeof(vals[1]), "%s", g_cfg.api_key[0] ? "********" : "(missing)");
     items[2] = "Endpoint";
     snprintf(vals[2], sizeof(vals[2]), "%s", config_endpoint());
@@ -1175,11 +1641,27 @@ static void screen_settings_draw(void) {
     items[12] = "Import Config JSON";
     vals[12][0] = '\0';
     items[13] = "Reset Multi-Model Selection";
-    snprintf(vals[13], sizeof(vals[13]), g_nmulti > 0 ? "%d selected" : "(none)", 0);
+    snprintf(vals[13], sizeof(vals[13]), g_nmulti > 0 ? "%d selected" : "(none)", g_nmulti);
+    items[14] = "Manage All API Keys (multi)";
+    {
+        int configured = 0, total = 0;
+        const provider_t **all = providers_all();
+        for (int i = 0; all[i]; i++) { total++; if (config_has_key_for(all[i]->id)) configured++; }
+        snprintf(vals[14], sizeof(vals[14]), "%d/%d configured", configured, total);
+    }
+    items[15] = "MCP Servers (tools)";
+    {
+        int tc = mcp_tool_count();
+        int sc = mcp_connected_count();
+        int total = mcp_server_count();
+        if (tc > 0) snprintf(vals[15], sizeof(vals[15]), "%d tool(s) from %d/%d server(s)", tc, sc, total);
+        else if (total > 0) snprintf(vals[15], sizeof(vals[15]), "%d server(s) disconnected", total);
+        else snprintf(vals[15], sizeof(vals[15]), "(none)");
+    }
 
     werase(w_main);
     mvwprintw(w_main, 0, 2, "Configuration (mirrors the web app settings)");
-    for (int i = 0; i < 14; i++) {
+    for (int i = 0; i < 16; i++) {
         settings_item(i, items[i], vals[i], i == g_settings_sel);
     }
     mvwprintw(w_main, getmaxy(w_main) - 1, 2, "Up/Down: move   Enter: edit   F1: help   Esc: back");
@@ -1187,16 +1669,21 @@ static void screen_settings_draw(void) {
 
 static void screen_settings_key(int ch) {
     if (ch == KEY_UP && g_settings_sel > 0) g_settings_sel--;
-    else if (ch == KEY_DOWN && g_settings_sel < 13) g_settings_sel++;
+    else if (ch == KEY_DOWN && g_settings_sel < 15) g_settings_sel++;
     else if (ch == 27) g_screen = SCREEN_CHAT;
     else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
         switch (g_settings_sel) {
-            case 0: settings_select_provider(); config_load(); fetch_models(); break;
+            case 0: settings_select_provider(); fetch_models(); break;
             case 1: {
                 char v[2048];
                 if (tui_prompt("API Key", g_cfg.api_key, v, sizeof(v))) {
-                    snprintf(g_cfg.api_key, sizeof(g_cfg.api_key), "%s", v);
+                    snprintf(g_cfg.api_key, sizeof(g_cfg.api_key), "%s", str_trim(v));
                     config_save();
+                    /* immediately request model list from provider and cache it */
+                    fetch_models();
+                    char *msg = xasprintf("Key saved. Models for %s: %d (cache updated)", g_cfg.provider, g_nmodels);
+                    tui_alert(msg);
+                    free(msg);
                 }
                 break;
             }
@@ -1249,48 +1736,105 @@ static void screen_settings_key(int ch) {
                 break;
             }
             case 9: {
-                if (g_nmodels == 0) tui_alert("No models. Fetch first.");
-                else {
-                    /* model picker */
-                    int h = LINES - 10, w = 64;
-                    if (h > g_nmodels + 4) h = g_nmodels + 4;
-                    int y0 = (LINES - h) / 2, x0 = (COLS - w) / 2;
-                    WINDOW *win = tui_win(h, w, y0, x0);
-                    WINDOW *list = tui_win(h - 4, w - 2, y0 + 2, x0 + 1);
-                    tui_box(win, "Select Model");
-                    int sel = 0;
-                    for (int i = 0; i < g_nmodels; i++)
-                        if (!strcmp(g_models[i], g_cfg.selected_model)) sel = i;
-                    bool dd = false;
-                    while (!dd) {
-                        werase(list);
-                        int lh = getmaxy(list);
-                        int top = sel - lh / 2;
-                        if (top < 0) top = 0;
-                        for (int i = 0; i < lh && top + i < g_nmodels; i++) {
-                            int idx = top + i;
-                            if (idx == sel) wattron(list, A_REVERSE);
-                            mvwprintw(list, i, 0, "%s", g_models[idx]);
-                            if (idx == sel) wattroff(list, A_REVERSE);
-                        }
-                        wrefresh(list);
-                        wrefresh(win);
-                        int c = getch();
-                        if (c == 27) dd = true;
-                        else if (c == KEY_UP && sel > 0) sel--;
-                        else if (c == KEY_DOWN && sel < g_nmodels - 1) sel++;
-                        else if (c == '\n' || c == '\r' || c == KEY_ENTER) {
-                            snprintf(g_cfg.selected_model, sizeof(g_cfg.selected_model), "%s", g_models[sel]);
-                            config_save();
-                            dd = true;
+                /* single model picker — grouped by provider with key hint */
+                const provider_t **all = providers_all();
+                int nprov = 0; while (all[nprov]) nprov++;
+                disp_row_t *disp = malloc(sizeof(disp_row_t) * (size_t)(nprov*2 + g_nmodels + 10));
+                int disp_n = 0;
+                for (int p = 0; p < nprov; p++) {
+                    const char *pid = all[p]->id;
+                    disp[disp_n++] = (disp_row_t){0, -1, pid};
+                    int cnt = 0;
+                    for (int i = 0; i < g_nmodels; i++) if (g_model_providers[i] && !strcmp(g_model_providers[i], pid)) cnt++;
+                    if (cnt == 0) {
+                        disp[disp_n++] = (disp_row_t){2, -1, pid};
+                    } else {
+                        for (int i = 0; i < g_nmodels; i++) if (g_model_providers[i] && !strcmp(g_model_providers[i], pid))
+                            disp[disp_n++] = (disp_row_t){1, i, pid};
+                    }
+                }
+                int h = LINES - 10, w = 70;
+                if (w > COLS - 4) w = COLS - 4;
+                if (h > disp_n + 4) h = disp_n + 4;
+                if (h < 10) h = 10;
+                int y0 = (LINES - h) / 2, x0 = (COLS - w) / 2;
+                WINDOW *win = tui_win(h, w, y0, x0);
+                WINDOW *list = tui_win(h - 4, w - 2, y0 + 2, x0 + 1);
+                tui_box(win, "Select Model (by provider) - Enter to select");
+                int sel_disp = -1;
+                for (int i = 0; i < disp_n; i++) if (disp[i].kind==1 && g_model_providers[disp[i].model_idx] && !strcmp(g_model_providers[disp[i].model_idx], g_cfg.provider) && !strcmp(g_models[disp[i].model_idx], g_cfg.selected_model)) { sel_disp = i; break; }
+                if (sel_disp < 0) for (int i = 0; i < disp_n; i++) if (disp[i].kind==1) { sel_disp = i; break; }
+                if (sel_disp < 0) sel_disp = 0;
+                bool dd = false;
+                while (!dd) {
+                    werase(list);
+                    int lh = getmaxy(list);
+                    int top = sel_disp - lh/2;
+                    if (top < 0) top = 0;
+                    if (top + lh > disp_n) top = disp_n - lh;
+                    if (top < 0) top = 0;
+                    for (int i = 0; i < lh && top+i < disp_n; i++) {
+                        int idx = top+i;
+                        disp_row_t *r = &disp[idx];
+                        if (r->kind == 0) {
+                            wattron(list, COLOR_PAIR(MD_HEADING) | A_BOLD);
+                            bool is_cur = !strcmp(r->provider, g_cfg.provider);
+                            mvwprintw(list, i, 0, "─ %s %s", r->provider, is_cur ? "(current)" : "");
+                            wattroff(list, COLOR_PAIR(MD_HEADING) | A_BOLD);
+                        } else if (r->kind == 2) {
+                            const provider_t *pr = providers_find(r->provider);
+                            bool need_key = pr && pr->has_key && !config_has_key_for(r->provider);
+                            if (need_key) {
+                                wattron(list, COLOR_PAIR(MD_WARN));
+                                mvwprintw(list, i, 0, "  [!] Insert API key in Settings (provider: %s)", r->provider);
+                                wattroff(list, COLOR_PAIR(MD_WARN));
+                            } else {
+                                wattron(list, COLOR_PAIR(MD_DIM));
+                                mvwprintw(list, i, 0, "  (no models - press Fetch Models or check network)");
+                                wattroff(list, COLOR_PAIR(MD_DIM));
+                            }
+                        } else {
+                            int mi = r->model_idx;
+                            bool is_sel = (idx == sel_disp);
+                            if (is_sel) wattron(list, A_REVERSE);
+                            mvwprintw(list, i, 0, "%s", g_models[mi]);
+                            if (is_sel) wattroff(list, A_REVERSE);
                         }
                     }
-                    delwin(list);
-                    delwin(win);
+                    wrefresh(list);
+                    wrefresh(win);
+                    int c = getch();
+                    if (c == 27) dd = true;
+                    else if (c == KEY_UP) {
+                        int cur = sel_disp - 1;
+                        while (cur >= 0 && disp[cur].kind != 1) cur--;
+                        if (cur >= 0) sel_disp = cur;
+                    } else if (c == KEY_DOWN) {
+                        int cur = sel_disp + 1;
+                        while (cur < disp_n && disp[cur].kind != 1) cur++;
+                        if (cur < disp_n) sel_disp = cur;
+                    } else if (c == '\n' || c == '\r' || c == KEY_ENTER) {
+                        if (disp[sel_disp].kind == 1) {
+                            int mi = disp[sel_disp].model_idx;
+                            const char *pid = g_model_providers[mi];
+                            if (pid && strcmp(pid, g_cfg.provider)) {
+                                config_switch_provider(pid);
+                            }
+                            snprintf(g_cfg.selected_model, sizeof(g_cfg.selected_model), "%s", g_models[mi]);
+                            config_save();
+                            char *msg = xasprintf("Selected model %s from %s", g_models[mi], pid);
+                            tui_alert(msg);
+                            free(msg);
+                        }
+                        dd = true;
+                    }
                 }
+                delwin(list);
+                delwin(win);
+                free(disp);
                 break;
             }
-            case 10: fetch_models(); config_save(); break;
+            case 10: fetch_models(); config_save(); { char *msg = xasprintf("Fetched %d models from all providers", g_nmodels); tui_alert(msg); free(msg); } break;
             case 11: {
                 char path[4096];
                 char *def = xasprintf("%s/hub-config.json", hub_dir());
@@ -1346,6 +1890,8 @@ static void screen_settings_key(int ch) {
                 break;
             }
             case 13: multi_free(); break;
+            case 14: settings_manage_api_keys(); fetch_models(); break;
+            case 15: mcp_manage_dialog(); break;
         }
     }
 }
@@ -1358,7 +1904,9 @@ static void screen_help(void) {
     if (w < 40) w = 40;
     int y0 = 2, x0 = 4;
     WINDOW *win = tui_win(h, w, y0, x0);
-    tui_box(win, "Help");
+    char title[64];
+    snprintf(title, sizeof(title), "Help - v%s", HUB_VERSION);
+    tui_box(win, title);
     const char *lines[] = {
         "Global:",
         "  [1..6]  switch screens (Chat, Notes, Store, IDE, Settings, RAG)",
@@ -1367,7 +1915,7 @@ static void screen_help(void) {
         "  Plain hotkeys (q, ?, 1-6, Tab, x) need 3 presses within 1s (F-keys/Ctrl instant)",
         "Chat:",
         "  Enter send | Esc stop | F2 new | F3 rename | F4 delete",
-        "  F5 summarize | F6 regenerate | F7 multi-model | F8 debate | F9 sandbox | F10 attach",
+        "  F5 summarize | F6 regenerate | F7 multi-model (cross-provider) | F8 debate | F9 sandbox | F10 attach",
         "  Up/Down select session | PgUp/PgDn scroll messages",
         "Notes:",
         "  F2 new | F3 delete | F4 AI complement | F5 export MD | F6 export RAG",
@@ -1383,7 +1931,10 @@ static void screen_help(void) {
         "  Tab switch focus | In file list: Up/Down select, Enter open, PgUp/PgDn switch tabs",
         "  x delete file | Space in agent input sends to AI coding agent.",
         "Settings:",
-        "  Up/Down move | Enter edit | F1 help",
+        "  Up/Down move | Enter edit | F1 help | 16:MCP Servers",
+        "MCP:",
+        "  Settings -> MCP Servers: a:add r:reconnect d:delete",
+        "  Chat shows MCP badge in status bar; agent uses tools when ready",
         "",
         "Press any key to close",
     };
@@ -1418,7 +1969,9 @@ static void draw_tabbar(void) {
         x += (int)strlen(names[i]) + 6;
     }
     wattrset(w_tabbar, COLOR_PAIR(MD_DIM));
-    mvwprintw(w_tabbar, 0, COLS - 26, "[?] Help   [q] Quit");
+    char ver[32];
+    snprintf(ver, sizeof(ver), "v%s", HUB_VERSION);
+    mvwprintw(w_tabbar, 0, COLS - 36, "[?] Help   [q] Quit  %s", ver);
     wattrset(w_tabbar, A_NORMAL);
     wrefresh(w_tabbar);
 }
@@ -1426,14 +1979,25 @@ static void draw_tabbar(void) {
 static void draw_status(void) {
     werase(w_status);
     char line[512];
-    const char *model = g_nmulti > 0 ? "[Multi]" : (g_cfg.selected_model[0] ? g_cfg.selected_model : "no model");
-    const char *vim = g_vim_mode ? (g_vim_insert ? "[VIM-INSERT]" : "[VIM]") : "";
-    if (g_streaming) {
-        snprintf(line, sizeof(line), " %s | %.90s | Streaming active | Tokens: %d (~%.4f USD) %s ",
-                 g_cfg.provider, model, g_last_tokens, g_last_cost, vim);
+    const char *model;
+    static char multi_buf[128];
+    if (g_nmulti > 0) {
+        snprintf(multi_buf, sizeof(multi_buf), "[Multi %d models]", g_nmulti);
+        model = multi_buf;
     } else {
-        snprintf(line, sizeof(line), " %s | %.90s | Tokens: %d (~%.4f USD) %s ",
-                 g_cfg.provider, model, g_last_tokens, g_last_cost, vim);
+        model = g_cfg.selected_model[0] ? g_cfg.selected_model : "no model";
+    }
+    const char *vim = g_vim_mode ? (g_vim_insert ? "[VIM-INSERT]" : "[VIM]") : "";
+    char mcp_badge[64] = "";
+    int tc = mcp_tool_count();
+    int sc = mcp_connected_count();
+    if (tc > 0) snprintf(mcp_badge, sizeof(mcp_badge), " MCP:%d/%d", tc, sc);
+    if (g_streaming) {
+        snprintf(line, sizeof(line), " %s | %.90s | Streaming | Tokens: %d (~%.4f USD)%s %s ",
+                 g_cfg.provider, model, g_last_tokens, g_last_cost, mcp_badge, vim);
+    } else {
+        snprintf(line, sizeof(line), " %s | %.90s | Tokens: %d (~%.4f USD)%s %s ",
+                 g_cfg.provider, model, g_last_tokens, g_last_cost, mcp_badge, vim);
     }
     wattrset(w_status, COLOR_PAIR(MD_DIM));
     mvwprintw(w_status, 0, 0, "%.*s", COLS, line);
@@ -2308,6 +2872,7 @@ void app_run(void) {
     /* state init */
     storage_init();
     config_load();
+    mcp_load();
     g_vim_mode = !strcmp(storage_get("gem_vim_mode"), "1");
     chat_load(&g_chat);
     notes_load(&g_notes);
@@ -2332,6 +2897,7 @@ void app_run(void) {
     ed_init(&g_note_editor);
     ed_init(&g_ide_editor);
 
+    mcp_connect_all();
     fetch_models();
 
     session_t *s = chat_current(&g_chat);
