@@ -60,7 +60,7 @@ All data stays local — no cloud sync, serverless & privacy-first.
 
 ## 🛡️ 100% Privacy-First & Serverless
 * **Zero Middleman Servers:** This is a 100% client-side application.
-* **Direct Routing:** Your API tokens are saved strictly in your local config (`~/.cache/traliran-cache/hub-config.json`) and sent straight to the official AI providers. No logs, no data collection, no leaks.
+* **Direct Routing:** Your API tokens are saved strictly in your local config (`~/.cache/traliran-cache/storage.json`) and sent straight to the official AI providers. No logs, no data collection, no leaks.
 * **AGPLv3 Guaranteed:** Total freedom to audit, inspect, and host the code yourself, backed by a strong copyleft license that keeps the project forever open.
 
 ---
