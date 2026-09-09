@@ -4,6 +4,14 @@
 
 A lightweight, serverless, and privacy-first AI terminal client (TUI) with a built-in code execution sandbox, a dedicated AI-powered Integrated Development Environment (IDE), and multi-model parallel benchmarking. Connect directly to Groq, Gemini, OpenAI, OpenRouter, DeepSeek, Qwen, GLM, Claude, and local backends (Ollama / Llama.cpp) straight from your terminal.
 
+## ⚠️ Warning! ⚠️
+
+> When you export a custom bot configuration that you've created, **your API keys are also exported**.
+> 
+> So before sharing your configuration, **REMOVE YOUR API KEYS FROM THE .json FILE**
+> 
+> P.S. This was designed to make it easy to import or restore your session later.
+
 ---
 
 ## 🖥️ CLI / TUI Edition
