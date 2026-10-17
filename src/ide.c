@@ -564,7 +564,9 @@ char **ide_branch_list(int *n_out) {
     *n_out = 0;
     if (!ide_git_available()) return NULL;
     char *d = shq(g_active_path);
-    char *out = run_capture("git -C %s branch --format=%%(refname:short) 2>/dev/null", d);
+    char *fmt = shq("%(refname:short)");   /* quote: '(' and ')' are shell metacharacters */
+    char *out = run_capture("git -C %s branch --format=%s 2>/dev/null", d, fmt);
+    free(fmt);
     free(d);
     char **list = NULL;
     int n = 0;

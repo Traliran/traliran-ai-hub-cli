@@ -3014,9 +3014,6 @@ static void ide_bots_key(int ch) {
 static void ide_editor_key(int ch) {
     switch (ch) {
         case '\t': g_ide_focus = 1; break;
-        case KEY_F(1): g_ide_left_tab = 0; g_ide_focus = 2; break;
-        case KEY_F(2): g_ide_left_tab = 1; g_ide_focus = 2; break;
-        case KEY_F(3): g_ide_left_tab = 2; g_ide_focus = 2; break;
         case KEY_F(4): ide_new_file_ui(); break;
         case KEY_F(6): ide_preview(); break;
         case KEY_F(7): {
@@ -3084,6 +3081,11 @@ static void screen_ide_key(int ch) {
     if (ch == KEY_F(11)) { ide_toggle_agentic(); return; }
     if (g_ide_agentic_only) { ide_agent_key(ch); return; }
     if (g_ide_focus == 1) { ide_agent_key(ch); return; }
+    /* F1/F2/F3 pick the left tab from either editor or left-panel focus, so
+     * switching tabs keeps working after focus moved into the panel. */
+    if (ch == KEY_F(1)) { g_ide_left_tab = 0; g_ide_focus = 2; return; }
+    if (ch == KEY_F(2)) { g_ide_left_tab = 1; g_ide_focus = 2; return; }
+    if (ch == KEY_F(3)) { g_ide_left_tab = 2; g_ide_focus = 2; return; }
     if (g_ide_focus == 2) {
         if (g_ide_left_tab == 0) ide_files_key(ch);
         else if (g_ide_left_tab == 1) ide_git_key(ch);
