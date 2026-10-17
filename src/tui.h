@@ -87,5 +87,6 @@ bool tui_confirm(const char *title);                       /* Y/N */
 void tui_alert(const char *title);
 bool tui_prompt(const char *title, const char *initial, char *out, size_t outsz);
 bool tui_pick_file(const char *title, char *out, size_t outsz); /* path picker */
+bool tui_pick_dir(const char *title, const char *start, char *out, size_t outsz); /* folder picker */
 
 #endif /* HUB_TUI_H */

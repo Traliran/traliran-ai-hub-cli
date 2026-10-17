@@ -75,10 +75,10 @@ static char *g_ide_open[64];
 static int g_ide_nopen;
 static char g_ide_active[512];
 static editor_t g_ide_editor;
-static int g_ide_left_tab;
-static int g_ide_focus;          /* 0 editor, 1 agent input, 2 file list */
+static int g_ide_left_tab;       /* 0 files, 1 git, 2 bots */
+static int g_ide_focus;          /* 0 editor, 1 agent input, 2 left panel */
 static int g_ide_fsel;           /* selected file in the file list */
-static agent_chat_t g_agent_chat;
+static bool g_ide_agentic_only;  /* show the agent chat only (web "Agentic Only") */
 static mv_t g_agent_view;
 static input_t g_agent_input;
 static progress_t g_progress;
@@ -87,7 +87,6 @@ static progress_t g_progress;
 static int g_settings_sel;
 
 /* rag */
-static rag_chat_t g_rag_chat;
 static mv_t g_rag_view;
 static input_t g_rag_input;
 static int g_rag_focus;          /* 0 chat input, 1 kb file list */
@@ -995,6 +994,162 @@ static void ide_close_file(int idx) {
     }
 }
 
+/* Drop every open tab; used when the active repository/branch changes. */
+static void ide_close_all_files(void) {
+    for (int i = 0; i < g_ide_nopen; i++) free(g_ide_open[i]);
+    g_ide_nopen = 0;
+    g_ide_active[0] = '\0';
+    g_ide_fsel = 0;
+    ed_set_text(&g_ide_editor, "");
+}
+
+/* ---------- repositories & branches (GIT tab) ---------- */
+
+static void ide_new_repo_ui(void) {
+    char name[256];
+    if (!tui_prompt("New repository name", "", name, sizeof(name))) return;
+    char *t = str_dup_trim(name);
+    if (!t[0]) { free(t); return; }
+    char path[4096] = "";
+    if (!tui_pick_dir("Choose a folder for this repository", NULL, path, sizeof(path))) {
+        free(t);
+        return;
+    }
+    ide_repo_create(t, path);
+    free(t);
+    ide_close_all_files();
+    tui_alert("Repository created and activated.");
+}
+
+/* Generic list picker; returns selected index or -1. */
+static int pick_from_list(const char *title, char **items, int n) {
+    if (n <= 0) return -1;
+    int h = n + 4, w = 60;
+    if (h > LINES - 4) h = LINES - 4;
+    if (w > COLS - 4) w = COLS - 4;
+    int y0 = (LINES - h) / 2, x0 = (COLS - w) / 2;
+    WINDOW *win = tui_win(h, w, y0, x0);
+    WINDOW *list = tui_win(h - 4, w - 2, y0 + 2, x0 + 1);
+    tui_box(win, title);
+    int sel = 0;
+    int chosen = -1;
+    bool done = false;
+    while (!done) {
+        werase(list);
+        int lh = getmaxy(list);
+        int top = sel - lh / 2;
+        if (top < 0) top = 0;
+        if (top + lh > n) top = n - lh;
+        if (top < 0) top = 0;
+        for (int i = 0; i < lh && top + i < n; i++) {
+            int idx = top + i;
+            if (idx == sel) wattron(list, A_REVERSE);
+            mvwprintw(list, i, 0, "%.*s", w - 4, items[idx]);
+            if (idx == sel) wattroff(list, A_REVERSE);
+        }
+        mvwprintw(win, h - 2, 2, "Enter: select   Esc: cancel");
+        wrefresh(list);
+        wrefresh(win);
+        int ch = getch();
+        if (ch == 27) done = true;
+        else if (ch == KEY_UP && sel > 0) sel--;
+        else if (ch == KEY_DOWN && sel < n - 1) sel++;
+        else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) { chosen = sel; done = true; }
+    }
+    delwin(list);
+    delwin(win);
+    return chosen;
+}
+
+static void ide_switch_repo_ui(void) {
+    int n = ide_repos_count();
+    if (n <= 1) { tui_alert("Only one repository. Press R to add one."); return; }
+    char **items = calloc((size_t)n, sizeof(char *));
+    for (int i = 0; i < n; i++)
+        items[i] = xasprintf("%s  (%s)%s", ide_repo_name(i), ide_repo_path(i),
+                             i == ide_repo_active_index() ? "  [active]" : "");
+    int sel = pick_from_list("Switch repository", items, n);
+    for (int i = 0; i < n; i++) free(items[i]);
+    free(items);
+    if (sel >= 0 && sel != ide_repo_active_index()) {
+        ide_repo_switch(sel);
+        ide_close_all_files();
+    }
+}
+
+static void ide_delete_repo_ui(void) {
+    if (ide_repos_count() <= 1) { tui_alert("At least one repository is required."); return; }
+    char *msg = xasprintf("Remove repository '%s'? Files on disk are kept.", ide_repo_name(ide_repo_active_index()));
+    bool ok = tui_confirm(msg);
+    free(msg);
+    if (!ok) return;
+    ide_repo_remove(ide_repo_active_index());
+    ide_close_all_files();
+}
+
+static void ide_new_branch_ui(void) {
+    if (!ide_git_available()) { tui_alert("Git is not installed; cannot manage branches."); return; }
+    char name[256];
+    if (!tui_prompt("New branch name", "", name, sizeof(name))) return;
+    char *t = str_dup_trim(name);
+    if (t[0] && !ide_branch_create(t)) tui_alert("Cannot create branch (invalid name?).");
+    free(t);
+}
+
+static void ide_switch_branch_ui(void) {
+    if (!ide_git_available()) { tui_alert("Git is not installed; cannot manage branches."); return; }
+    int n = 0;
+    char **list = ide_branch_list(&n);
+    if (n <= 1) { ide_branch_free_list(list, n); tui_alert("Only one branch. Press b to add one."); return; }
+    char *cur = ide_branch_current();
+    char **items = calloc((size_t)n, sizeof(char *));
+    for (int i = 0; i < n; i++)
+        items[i] = xasprintf("%s%s", list[i], !strcmp(list[i], cur) ? "  [active]" : "");
+    int sel = pick_from_list("Switch branch", items, n);
+    for (int i = 0; i < n; i++) free(items[i]);
+    free(items);
+    free(cur);
+    if (sel >= 0 && !strcmp(list[sel], ide_branch_current())) { ide_branch_free_list(list, n); return; }
+    if (sel >= 0) {
+        if (ide_branch_switch(list[sel])) ide_close_all_files();
+        else tui_alert("Cannot switch branch (uncommitted changes?).");
+    }
+    ide_branch_free_list(list, n);
+}
+
+static void ide_delete_branch_ui(void) {
+    if (!ide_git_available()) { tui_alert("Git is not installed; cannot manage branches."); return; }
+    char *cur = ide_branch_current();
+    char *msg = xasprintf("Delete branch '%s' and its stored commits?", cur);
+    bool ok = tui_confirm(msg);
+    free(msg);
+    if (ok && !ide_branch_delete(cur)) tui_alert("Cannot delete branch (at least one must remain).");
+    free(cur);
+}
+
+/* ---------- IDE agent chat sessions ---------- */
+
+static void agent_session_prev(void) {
+    int c = agent_session_current();
+    if (c > 0) agent_session_select(c - 1);
+}
+static void agent_session_next(void) {
+    int c = agent_session_current();
+    if (c < agent_sessions_count() - 1) agent_session_select(c + 1);
+}
+static void agent_session_rename_ui(void) {
+    const char *cur = agent_session_name(agent_session_current());
+    char nm[256];
+    if (tui_prompt("Rename chat", cur, nm, sizeof(nm))) {
+        char *t = str_dup_trim(nm);
+        if (t[0]) agent_session_rename(agent_session_current(), t);
+        free(t);
+    }
+}
+static void agent_session_delete_ui(void) {
+    if (tui_confirm("Delete this chat?")) agent_session_delete(agent_session_current());
+}
+
 static void ide_preview(void) {
     /* combine html + css + js like the web PREVIEW module */
     int n = 0;
@@ -1107,11 +1262,14 @@ static void agent_send(void) {
         tui_alert("Select a model first (Settings).");
         return;
     }
+    agent_chat_t *chat = agent_session_chat();
+    if (!chat) { free(text); return; }
     in_set(&g_agent_input, "");
+    agent_session_autoname(text);   /* empty "Chat #n" chats take the first message */
     agent_arg_t *a = calloc(1, sizeof(*a));
     a->model = xstrdup(model);
     a->user_message = text;
-    a->chat = &g_agent_chat;
+    a->chat = chat;
     a->stop = &g_job_stop;
     a->progress_ptr = &g_progress;
     progress_set(&g_progress, "Thinking...");
@@ -1121,6 +1279,7 @@ static void agent_send(void) {
     job_join(&g_job);
     progress_set(&g_progress, "");
     g_agent_view.follow = 1;
+    agent_sessions_save();
     free(a->model);
     free(a->user_message);
     free(a);
@@ -1128,8 +1287,30 @@ static void agent_send(void) {
 
 /* =================== RAG screen =================== */
 
+static void rag_session_prev(void) {
+    int c = rag_session_current();
+    if (c > 0) rag_session_select(c - 1);
+}
+static void rag_session_next(void) {
+    int c = rag_session_current();
+    if (c < rag_sessions_count() - 1) rag_session_select(c + 1);
+}
+static void rag_session_rename_ui(void) {
+    const char *cur = rag_session_name(rag_session_current());
+    char nm[256];
+    if (tui_prompt("Rename chat", cur, nm, sizeof(nm))) {
+        char *t = str_dup_trim(nm);
+        if (t[0]) rag_session_rename(rag_session_current(), t);
+        free(t);
+    }
+}
+static void rag_session_delete_ui(void) {
+    if (tui_confirm("Delete this chat?")) rag_session_delete(rag_session_current());
+}
+
 static void rag_rebuild_view(void) {
-    char *snap = rag_chat_snapshot(&g_rag_chat);
+    rag_chat_t *log = rag_session_chat();
+    char *snap = log ? chatlog_snapshot(log) : xstrdup("");
     mv_clear(&g_rag_view);
     mv_add_md(&g_rag_view, snap, false);
     free(snap);
@@ -1197,11 +1378,14 @@ static void rag_send(void) {
         tui_alert("Select a model first (Settings).");
         return;
     }
+    rag_chat_t *chat = rag_session_chat();
+    if (!chat) { free(text); return; }
     in_set(&g_rag_input, "");
+    rag_session_autoname(text);
     rag_arg_t *a = calloc(1, sizeof(*a));
     a->model = xstrdup(g_cfg.selected_model);
     a->user_message = text;
-    a->chat = &g_rag_chat;
+    a->chat = chat;
     a->stop = &g_job_stop;
     a->progress_ptr = &g_progress;
     kb_load(&a->kb);   /* loaded on the main thread; the worker only reads it */
@@ -1212,6 +1396,8 @@ static void rag_send(void) {
     job_join(&g_job);
     progress_set(&g_progress, "");
     kb_clear(&a->kb);
+    g_rag_view.follow = 1;
+    rag_sessions_save();
     free(a->model);
     free(a->user_message);
     free(a);
@@ -1243,8 +1429,11 @@ static void screen_rag_draw(void) {
         mvwprintw(leftwin, i + 1, left_w - 9, "%6s", sizebuf);
     }
     if (kb.n == 0) mvwprintw(leftwin, 2, 1, "(empty - press F2 to upload)");
-    mvwprintw(leftwin, h - 3, 1, "F2 upload | F3 delete | F4 to Notes");
-    mvwprintw(leftwin, h - 2, 1, g_rag_focus == 1 ? "Tab: chat | Up/Down: select" : "Tab: files | F10: clear chat");
+    mvwprintw(leftwin, h - 3, 1, "F2 up | F3 del | F4 note");
+    if (g_rag_focus == 1)
+        mvwprintw(leftwin, h - 2, 1, "Tab: chat | Up/Down: select");
+    else
+        mvwprintw(leftwin, h - 2, 1, "Tab: files | F5/F6 chat | F7 new");
     wrefresh(leftwin);
     kb_clear(&kb);
 
@@ -1255,7 +1444,10 @@ static void screen_rag_draw(void) {
 
     /* input area */
     werase(inputwin);
-    mvwprintw(inputwin, 0, 1, "Ask about your documents:");
+    char label[256];
+    snprintf(label, sizeof(label), "Ask about your documents  [chat: %s]",
+             rag_session_name(rag_session_current()));
+    mvwprintw(inputwin, 0, 1, "%.*s", w - left_w - 2, label);
     WINDOW *inwin = tui_win(1, w - left_w - 10, area_y() + h - 2, left_w + 9);
     in_draw(&g_rag_input, inwin, 0, 0, w - left_w - 10);
     wrefresh(inputwin);
@@ -1291,7 +1483,12 @@ static void screen_rag_key(int ch) {
         case KEY_F(2): rag_upload(); break;
         case KEY_F(3): rag_delete_sel(); break;
         case KEY_F(4): rag_export_note(); break;
-        case KEY_F(10): rag_chat_clear(&g_rag_chat); break;
+        case KEY_F(5): rag_session_prev(); g_rag_view.follow = 1; break;
+        case KEY_F(6): rag_session_next(); g_rag_view.follow = 1; break;
+        case KEY_F(7): rag_session_new(); g_rag_view.follow = 1; break;
+        case KEY_F(8): rag_session_rename_ui(); break;
+        case KEY_F(9): rag_session_delete_ui(); g_rag_view.follow = 1; break;
+        case KEY_F(10): rag_session_clear(); break;
         case KEY_PPAGE: mv_scroll(&g_rag_view, -(area_h() - 3)); break;
         case KEY_NPAGE: mv_scroll(&g_rag_view, area_h() - 3); break;
         default:
@@ -1923,13 +2120,16 @@ static void screen_help(void) {
         "  PgUp/PgDn scroll note / preview",
         "RAG:",
         "  Enter send | F2 upload (.md/.txt) | F3 delete | F4 export to Notes",
-        "  Tab files <-> chat | Up/Down select file | PgUp/PgDn scroll chat | F10 clear chat",
+        "  F5/F6 prev/next chat | F7 new | F8 rename | F9 delete | F10 clear chat",
+        "  Tab files <-> chat | Up/Down select file | PgUp/PgDn scroll chat",
         "IDE:",
-        "  F1 files (focus list) | F2 versions | F3 bots | F4 new file | F6 preview",
+        "  F1 files | F2 GIT | F3 bots | F4 new file | F6 preview | F11 Agentic Only",
         "  F7 export | F8 import | F9 commit | F10 revert | F5 save",
-        "  PgUp/PgDn scroll editor (agent: scroll agent chat)",
-        "  Tab switch focus | In file list: Up/Down select, Enter open, PgUp/PgDn switch tabs",
-        "  x delete file | Space in agent input sends to AI coding agent.",
+        "  Files: Up/Down select, Enter open, r rename, n folder, x delete",
+        "  GIT: b new branch, s switch, d delete branch, R new repo, c switch, D delete",
+        "  Agent input: F2 new chat, F3 rename, F4 delete, F5/F6 prev/next",
+        "  Tab switch focus | PgUp/PgDn scroll editor/agent or switch file tabs",
+        "  Space in agent input sends to AI coding agent.",
         "Settings:",
         "  Up/Down move | Enter edit | F1 help | 16:MCP Servers",
         "MCP:",
@@ -2397,9 +2597,53 @@ static void screen_store_key(int ch) {
     }
 }
 
+/* Draw the agent chat panel inside a window spanning (px .. px+pw). */
+static void ide_draw_agent_panel(int px, int pw) {
+    int h = area_h();
+    WINDOW *win = tui_win(h, pw, area_y(), px);
+    const char *cn = agent_session_name(agent_session_current());
+    if (!cn || !cn[0]) cn = "chat";
+    char title[256];
+    ide_bot_t *ab = ide_bots_active();
+    if (ab) snprintf(title, sizeof(title), "Agent [%.*s] · %.*s", 24, ab->name, 40, cn);
+    else    snprintf(title, sizeof(title), "Agent · %.*s", 40, cn);
+    tui_box(win, title);
+
+    chatlog_t *log = agent_session_chat();
+    char *snap = log ? chatlog_snapshot(log) : xstrdup("");
+    mv_clear(&g_agent_view);
+    mv_add_md(&g_agent_view, snap, false);
+    free(snap);
+    if (g_job.done == 0) {
+        char *p = xstrdup(g_progress.text);
+        mv_add_plain(&g_agent_view, p, MD_WARN);
+        free(p);
+    }
+    if (g_agent_view.follow) g_agent_view.top = g_agent_view.nrow;
+    mv_draw(&g_agent_view, win, 1, getmaxy(win) - 3);
+    wattrset(win, COLOR_PAIR(MD_DIM));
+    mvwprintw(win, getmaxy(win) - 2, 1, "%.*s", pw - 2,
+              "F2 new F3 ren F4 del F5/F6 chat F11 agentic");
+    wattrset(win, A_NORMAL);
+    wrefresh(win);
+
+    WINDOW *ain = tui_win(1, pw - 2, area_y() + h - 1, px + 1);
+    in_draw(&g_agent_input, ain, 0, 0, pw - 2);
+    wrefresh(ain);
+    delwin(ain);
+    delwin(win);
+}
+
 static void screen_ide_draw(void) {
     int h = area_h();
     int w = COLS;
+
+    if (g_ide_agentic_only) {
+        /* Agentic Only: hide files/editor, show the agent chat full width. */
+        ide_draw_agent_panel(0, w);
+        return;
+    }
+
     int left_w = 30, right_w = 42;
     if (left_w > w / 4) left_w = w / 4;
     if (right_w > w / 3) right_w = w / 3;
@@ -2407,17 +2651,26 @@ static void screen_ide_draw(void) {
     WINDOW *leftwin = tui_win(h, left_w, area_y(), 0);
     WINDOW *tabsbar = tui_win(1, w - left_w - right_w, area_y(), left_w);
     WINDOW *edwin = tui_win(h - 1, w - left_w - right_w, area_y() + 1, left_w);
-    WINDOW *rightwin = tui_win(h, right_w, area_y(), w - right_w);
-    WINDOW *agentin = tui_win(1, right_w - 2, area_y() + h - 1, w - right_w + 1);
 
     /* left panel with tabs */
     tui_box(leftwin, "IDE");
-    const char *ltabs[3] = { "Files", "Versions", "Bots" };
+    const char *ltabs[3] = { "Files", "GIT", "Bots" };
     for (int i = 0; i < 3; i++) {
         int x = 1 + i * 9;
         if (i == g_ide_left_tab) wattron(leftwin, COLOR_PAIR(MD_ACCENT) | A_BOLD);
         mvwprintw(leftwin, 1, x, "F%d %s", i + 1, ltabs[i]);
         if (i == g_ide_left_tab) wattroff(leftwin, COLOR_PAIR(MD_ACCENT) | A_BOLD);
+    }
+    /* active repository · branch header */
+    {
+        char *br = ide_branch_current();
+        char hdr[160];
+        snprintf(hdr, sizeof(hdr), "%s · %s", ide_repo_name(ide_repo_active_index()),
+                 (br && br[0]) ? br : "main");
+        wattrset(leftwin, COLOR_PAIR(MD_HEADING));
+        mvwprintw(leftwin, 2, 1, "%.*s", left_w - 2, hdr);
+        wattrset(leftwin, A_NORMAL);
+        free(br);
     }
 
     if (g_ide_left_tab == 0) {
@@ -2429,7 +2682,7 @@ static void screen_ide_draw(void) {
         }
         if (g_ide_fsel < 0) g_ide_fsel = 0;
         if (g_ide_fsel >= n) g_ide_fsel = n > 0 ? n - 1 : 0;
-        for (int i = 0; i < n && i < h - 5; i++) {
+        for (int i = 0; i < n && i < h - 6; i++) {
             bool sel = (i == g_ide_fsel && g_ide_focus == 2);
             bool active = !strcmp(files[i], g_ide_active);
             if (sel) wattron(leftwin, A_REVERSE);
@@ -2439,19 +2692,36 @@ static void screen_ide_draw(void) {
             else if (active) wattroff(leftwin, COLOR_PAIR(MD_GREEN) | A_BOLD);
         }
         ide_free_list(files, n);
+        mvwprintw(leftwin, h - 2, 1, "r: rename   n: new folder   x: delete");
         if (g_ide_focus == 2)
             mvwprintw(leftwin, h - 1, 1, "Up/Down: select   Enter: open");
         else
-            mvwprintw(leftwin, h - 1, 1, "F1: select file   x: delete active");
+            mvwprintw(leftwin, h - 1, 1, "F1: select file   F4: new file");
     } else if (g_ide_left_tab == 1) {
-        mvwprintw(leftwin, 3, 1, "[F9] new commit   [F10] revert");
+        int row = 3;
+        int bn = 0;
+        char **bl = ide_branch_list(&bn);
+        char *curb = ide_branch_current();
+        mvwprintw(leftwin, row++, 1, "Branches:");
+        for (int i = 0; i < bn && row < h - 6; i++) {
+            bool act = !strcmp(bl[i], curb);
+            if (act) wattron(leftwin, COLOR_PAIR(MD_GREEN) | A_BOLD);
+            mvwprintw(leftwin, row++, 1, "%s%.*s", act ? "*" : " ", left_w - 3, bl[i]);
+            if (act) wattroff(leftwin, COLOR_PAIR(MD_GREEN) | A_BOLD);
+        }
+        free(curb);
+        ide_branch_free_list(bl, bn);
+        row++;
+        mvwprintw(leftwin, row++, 1, "Commits:");
         int cnt = vc_count();
-        for (int i = 0; i < cnt && i < h - 6; i++) {
+        for (int i = 0; i < cnt && row < h - 2; i++) {
             char *s = vc_summary(i);
-            mvwprintw(leftwin, i + 4, 1, "%.*s", left_w - 2, s ? s : "");
+            mvwprintw(leftwin, row++, 1, "%.*s", left_w - 2, s ? s : "");
             free(s);
         }
-        if (cnt == 0) mvwprintw(leftwin, 4, 1, "No commits yet.");
+        if (cnt == 0) mvwprintw(leftwin, row, 1, "No commits yet.");
+        mvwprintw(leftwin, h - 2, 1, "F9 commit  b new br  s switch br");
+        mvwprintw(leftwin, h - 1, 1, "d del br  R new repo  c repo  D del");
     } else {
         mvwprintw(leftwin, 3, 1, "Custom assistants:");
         int cnt = ide_bots_count();
@@ -2492,35 +2762,11 @@ static void screen_ide_draw(void) {
     wrefresh(edwin);
 
     /* right panel: agent chat */
-    ide_bot_t *ab = ide_bots_active();
-    if (ab) {
-        char *btitle = xasprintf("AI Agent [%s]", ab->name);
-        tui_box(rightwin, btitle);
-        free(btitle);
-    } else {
-        tui_box(rightwin, "AI Agent");
-    }
-    char *snap = agent_chat_snapshot(&g_agent_chat);
-    mv_clear(&g_agent_view);
-    mv_add_md(&g_agent_view, snap, false);
-    free(snap);
-    if (g_job.done == 0) {
-        char *p = xstrdup(g_progress.text);
-        mv_add_plain(&g_agent_view, p, MD_WARN);
-        free(p);
-    }
-    if (g_agent_view.follow) g_agent_view.top = g_agent_view.nrow;
-    mv_draw(&g_agent_view, rightwin, 1, getmaxy(rightwin) - 2);
-    wrefresh(rightwin);
-
-    in_draw(&g_agent_input, agentin, 0, 0, right_w - 2);
-    wrefresh(agentin);
+    ide_draw_agent_panel(w - right_w, right_w);
 
     delwin(leftwin);
     delwin(tabsbar);
     delwin(edwin);
-    delwin(rightwin);
-    delwin(agentin);
 }
 
 /* Triple-press gate: plain-character program hotkeys (q, ?, Tab, 1-5, x)
@@ -2553,71 +2799,224 @@ static void ide_switch_tab(int delta) {
     }
 }
 
-static void screen_ide_key(int ch) {
-    /* focus: 0 editor, 1 agent input, 2 file list */
-    if (g_ide_focus == 1) {
-        if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) { agent_send(); return; }
-        if (ch == 27 || ch == '\t') { g_ide_focus = 0; return; }
-        if (ch == KEY_PPAGE) { mv_scroll(&g_agent_view, -(area_h() - 2)); return; }
-        if (ch == KEY_NPAGE) { mv_scroll(&g_agent_view, area_h() - 2); return; }
-        in_key(&g_agent_input, ch);
+static void ide_toggle_agentic(void) {
+    g_ide_agentic_only = !g_ide_agentic_only;
+    storage_set("gem_ide_agentic_only", g_ide_agentic_only ? "1" : "0");
+    storage_save();
+    if (g_ide_agentic_only) g_ide_focus = 1;
+}
+
+/* ---- agent input focus ---- */
+static void ide_agent_key(int ch) {
+    if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) { agent_send(); return; }
+    if (ch == KEY_F(2)) { agent_session_new(); g_agent_view.follow = 1; return; }
+    if (ch == KEY_F(3)) { agent_session_rename_ui(); return; }
+    if (ch == KEY_F(4)) { agent_session_delete_ui(); g_agent_view.follow = 1; return; }
+    if (ch == KEY_F(5)) { agent_session_prev(); g_agent_view.follow = 1; return; }
+    if (ch == KEY_F(6)) { agent_session_next(); g_agent_view.follow = 1; return; }
+    if (ch == 27 || ch == '\t') { if (!g_ide_agentic_only) g_ide_focus = 0; return; }
+    if (ch == KEY_PPAGE) { mv_scroll(&g_agent_view, -(area_h() - 2)); return; }
+    if (ch == KEY_NPAGE) { mv_scroll(&g_agent_view, area_h() - 2); return; }
+    in_key(&g_agent_input, ch);
+}
+
+/* ---- left panel: files ---- */
+static void ide_files_key(int ch) {
+    if (ch == KEY_UP) { if (g_ide_fsel > 0) g_ide_fsel--; return; }
+    if (ch == KEY_DOWN) {
+        int n = 0;
+        char **files = ide_list_files(&n);
+        if (g_ide_fsel < n - 1) g_ide_fsel++;
+        ide_free_list(files, n);
         return;
     }
-    if (g_ide_focus == 2) {
-        if (g_ide_left_tab != 0) {
-            g_ide_focus = 0;
-        } else {
-            if (ch == KEY_UP) {
-                if (g_ide_fsel > 0) g_ide_fsel--;
-                return;
+    if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+        int n = 0;
+        char **files = ide_list_files(&n);
+        if (n > 0 && g_ide_fsel >= 0 && g_ide_fsel < n) ide_open_file(files[g_ide_fsel]);
+        ide_free_list(files, n);
+        return;
+    }
+    if (ch == 27 || ch == '\t') { g_ide_focus = 0; return; }
+    if (ch == KEY_F(4)) { ide_new_file_ui(); return; }
+    if (ch == KEY_PPAGE) { ide_switch_tab(-1); return; }
+    if (ch == KEY_NPAGE) { ide_switch_tab(1); return; }
+
+    int n = 0;
+    char **files = ide_list_files(&n);
+    bool have = (n > 0 && g_ide_fsel >= 0 && g_ide_fsel < n);
+    const char *target = have ? files[g_ide_fsel] : NULL;
+
+    if ((ch == 'x' || ch == 'X') && hotkey_gate(ch)) {
+        if (have) {
+            char *msg = xasprintf("Delete %s?", target);
+            if (tui_confirm(msg)) {
+                if (!ide_delete_file(target)) ide_delete_folder(target);
+                for (int i = 0; i < g_ide_nopen; i++)
+                    if (!strcmp(g_ide_open[i], target)) ide_close_file(i);
+                g_ide_fsel = 0;
             }
-            if (ch == KEY_DOWN) {
-                int n = 0;
-                char **files = ide_list_files(&n);
-                if (g_ide_fsel < n - 1) g_ide_fsel++;
-                ide_free_list(files, n);
-                return;
-            }
-            if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
-                int n = 0;
-                char **files = ide_list_files(&n);
-                if (n > 0 && g_ide_fsel >= 0 && g_ide_fsel < n)
-                    ide_open_file(files[g_ide_fsel]);
-                ide_free_list(files, n);
-                return;
-            }
-            if (ch == 27 || ch == '\t') { g_ide_focus = 0; return; }
-            if (ch == KEY_F(4)) { ide_new_file_ui(); return; }
-            if (ch == KEY_PPAGE) { ide_switch_tab(-1); return; }
-            if (ch == KEY_NPAGE) { ide_switch_tab(1); return; }
-            if (ch == 'x' || ch == 'X') {
-                if (hotkey_gate(ch)) {
-                    int n = 0;
-                    char **files = ide_list_files(&n);
-                    if (n > 0 && g_ide_fsel >= 0 && g_ide_fsel < n) {
-                        const char *target = files[g_ide_fsel];
-                        char *msg = xasprintf("Delete %s?", target);
-                        if (tui_confirm(msg)) {
-                            if (!ide_delete_file(target)) ide_delete_folder(target);
-                            for (int i = 0; i < g_ide_nopen; i++)
-                                if (!strcmp(g_ide_open[i], target)) ide_close_file(i);
-                            g_ide_fsel = 0;
-                        }
-                        free(msg);
+            free(msg);
+        }
+    } else if ((ch == 'r' || ch == 'R') && hotkey_gate(ch)) {
+        if (have) {
+            char nn[512];
+            snprintf(nn, sizeof(nn), "%s", target);
+            if (tui_prompt("Rename to (relative path)", nn, nn, sizeof(nn))) {
+                char *t = str_dup_trim(nn);
+                if (t[0] && strcmp(t, target) != 0) {
+                    if (ide_rename_path(target, t)) {
+                        for (int i = 0; i < g_ide_nopen; i++)
+                            if (!strcmp(g_ide_open[i], target)) { free(g_ide_open[i]); g_ide_open[i] = xstrdup(t); }
+                        if (!strcmp(g_ide_active, target))
+                            snprintf(g_ide_active, sizeof(g_ide_active), "%s", t);
+                    } else {
+                        tui_alert("Rename failed (invalid path or target exists).");
                     }
-                    ide_free_list(files, n);
                 }
-                return;
+                free(t);
             }
-            return;
+        }
+    } else if ((ch == 'n' || ch == 'N') && hotkey_gate(ch)) {
+        char nn[512];
+        if (tui_prompt("New folder path (e.g. src/assets)", "", nn, sizeof(nn))) {
+            char *t = str_dup_trim(nn);
+            if (t[0] && !ide_new_folder(t)) tui_alert("Cannot create folder.");
+            free(t);
         }
     }
+    ide_free_list(files, n);
+}
 
+/* ---- left panel: git (repositories, branches, commits) ---- */
+static void ide_git_key(int ch) {
+    if (ch == 27 || ch == '\t') { g_ide_focus = 0; return; }
+    switch (ch) {
+        case 'n': case 'N': ide_create_commit(); break;
+        case 'b': case 'B': ide_new_branch_ui(); break;
+        case 's': case 'S': ide_switch_branch_ui(); break;
+        case 'd': ide_delete_branch_ui(); break;
+        case 'D': ide_delete_repo_ui(); break;
+        case 'R': ide_new_repo_ui(); break;
+        case 'c': case 'C': ide_switch_repo_ui(); break;
+        case KEY_F(9): ide_create_commit(); break;
+        case KEY_F(10): {
+            char id[128];
+            snprintf(id, sizeof(id), "%s", vc_count() > 0 ? vc_id(0) : "");
+            if (tui_prompt("Revert to commit id", id, id, sizeof(id))) {
+                if (vc_revert_to(str_trim(id))) {
+                    ide_open_file(g_ide_active);
+                    tui_alert("Workspace reverted.");
+                } else tui_alert("Commit not found.");
+            }
+            break;
+        }
+    }
+}
+
+/* ---- left panel: bots ---- */
+static void ide_bots_key(int ch) {
+    if (ch == 27 || ch == '\t') { g_ide_focus = 0; return; }
+    if (ch == 'n') {
+        char name[256], prompt[4096], model[1024], tmp[64];
+        if (tui_prompt("Bot name", "", name, sizeof(name))) {
+            char *t = str_dup_trim(name);
+            if (t[0]) {
+                prompt[0] = '\0';
+                settings_edit_multiline("Bot system prompt", prompt, sizeof(prompt));
+                snprintf(model, sizeof(model), "%s", g_cfg.selected_model);
+                if (tui_prompt("Model (empty = from Settings)", model, model, sizeof(model))) {
+                    snprintf(tmp, sizeof(tmp), "%.2f", g_cfg.temperature);
+                    if (tui_prompt("Temperature", tmp, tmp, sizeof(tmp))) {
+                        ide_bot_t bot = {0};
+                        bot.name = t;
+                        bot.prompt = prompt;
+                        bot.model = str_dup_trim(model);
+                        bot.temp = atof(str_trim(tmp));
+                        ide_bot_save(&bot);
+                        free(bot.model);
+                    }
+                }
+            }
+            free(t);
+        }
+    } else if (ch == 'e') {
+        char n2[256];
+        if (tui_prompt("Edit bot (index)", "", n2, sizeof(n2))) {
+            int idx = atoi(str_trim(n2)) - 1;
+            if (idx >= 0 && idx < ide_bots_count()) {
+                ide_bot_t *b = ide_bots_get(idx);
+                char nn[256], pp[4096], mm[1024], tt[64];
+                snprintf(nn, sizeof(nn), "%s", b->name);
+                if (tui_prompt("Bot name", nn, nn, sizeof(nn))) {
+                    snprintf(pp, sizeof(pp), "%s", b->prompt);
+                    settings_edit_multiline("Bot system prompt", pp, sizeof(pp));
+                    snprintf(mm, sizeof(mm), "%s", b->model);
+                    if (tui_prompt("Model (empty = from Settings)", mm, mm, sizeof(mm))) {
+                        snprintf(tt, sizeof(tt), "%.2f", b->temp);
+                        if (tui_prompt("Temperature", tt, tt, sizeof(tt))) {
+                            ide_bot_t bot = {0};
+                            bot.id = b->id;
+                            bot.name = str_dup_trim(nn);
+                            bot.prompt = str_dup_trim(pp);
+                            bot.model = str_dup_trim(mm);
+                            bot.temp = atof(str_trim(tt));
+                            ide_bot_save(&bot);
+                            free(bot.name);
+                            free(bot.prompt);
+                            free(bot.model);
+                        }
+                    }
+                }
+            }
+        }
+    } else if (ch == 'u') {
+        char n3[256];
+        if (tui_prompt("Use bot index", "", n3, sizeof(n3))) {
+            int idx = atoi(str_trim(n3)) - 1;
+            ide_bot_set_active(idx);
+        }
+    } else if (ch == 'c') {
+        if (ide_bots_active()) {
+            ide_bot_set_active(-1);
+            tui_alert("Bot application cancelled; using Settings.");
+        }
+    } else if (ch == 'x') {
+        char n4[256];
+        if (tui_prompt("Delete bot index", "", n4, sizeof(n4))) {
+            int idx = atoi(str_trim(n4)) - 1;
+            ide_bot_delete(idx);
+        }
+    } else if (ch == 'o') {
+        char *json = ide_bots_export_json();
+        char path[4096];
+        char *def = xasprintf("%s/traliran-ide-bots.json", hub_dir());
+        if (tui_prompt("Export bots to", def, path, sizeof(path))) {
+            write_file(path, json);
+            tui_alert("Bots exported.");
+        }
+        free(def);
+        free(json);
+    } else if (ch == 'i') {
+        char path[4096];
+        if (tui_pick_file("Import bots JSON", path, sizeof(path))) {
+            char *json = read_file(path);
+            if (json) {
+                if (ide_bots_import_json(json)) tui_alert("Bots imported.");
+                else tui_alert("Invalid format.");
+                free(json);
+            }
+        }
+    }
+}
+
+/* ---- editor focus ---- */
+static void ide_editor_key(int ch) {
     switch (ch) {
         case '\t': g_ide_focus = 1; break;
         case KEY_F(1): g_ide_left_tab = 0; g_ide_focus = 2; break;
-        case KEY_F(2): g_ide_left_tab = 1; g_ide_focus = 0; break;
-        case KEY_F(3): g_ide_left_tab = 2; g_ide_focus = 0; break;
+        case KEY_F(2): g_ide_left_tab = 1; g_ide_focus = 2; break;
+        case KEY_F(3): g_ide_left_tab = 2; g_ide_focus = 2; break;
         case KEY_F(4): ide_new_file_ui(); break;
         case KEY_F(6): ide_preview(); break;
         case KEY_F(7): {
@@ -2668,101 +3067,6 @@ static void screen_ide_key(int ch) {
         }
         case KEY_F(5): ide_editor_save(); break;
         default:
-            /* left panel quick actions when tab == 2 (bots) */
-            if (g_ide_left_tab == 2) {
-                if (ch == 'n') {
-                    char name[256], prompt[4096], model[1024], tmp[64];
-                    if (tui_prompt("Bot name", "", name, sizeof(name))) {
-                        char *t = str_dup_trim(name);
-                        if (t[0]) {
-                            prompt[0] = '\0';
-                            settings_edit_multiline("Bot system prompt", prompt, sizeof(prompt));
-                            snprintf(model, sizeof(model), "%s", g_cfg.selected_model);
-                            if (!tui_prompt("Model (empty = from Settings)", model, model, sizeof(model)))
-                                break;
-                            snprintf(tmp, sizeof(tmp), "%.2f", g_cfg.temperature);
-                            if (!tui_prompt("Temperature", tmp, tmp, sizeof(tmp)))
-                                break;
-                            ide_bot_t bot = {0};
-                            bot.name = t;
-                            bot.prompt = prompt;
-                            bot.model = str_dup_trim(model);
-                            bot.temp = atof(str_trim(tmp));
-                            ide_bot_save(&bot);
-                            free(t);
-                            free(bot.model);
-                        }
-                    }
-                } else if (ch == 'e') {
-                    char n2[256];
-                    if (tui_prompt("Edit bot (index) or name", "", n2, sizeof(n2))) {
-                        int idx = atoi(str_trim(n2)) - 1;
-                        if (idx >= 0 && idx < ide_bots_count()) {
-                            ide_bot_t *b = ide_bots_get(idx);
-                            char nn[256], pp[4096], mm[1024], tt[64];
-                            snprintf(nn, sizeof(nn), "%s", b->name);
-                            if (tui_prompt("Bot name", nn, nn, sizeof(nn))) {
-                                snprintf(pp, sizeof(pp), "%s", b->prompt);
-                                settings_edit_multiline("Bot system prompt", pp, sizeof(pp));
-                                snprintf(mm, sizeof(mm), "%s", b->model);
-                                if (!tui_prompt("Model (empty = from Settings)", mm, mm, sizeof(mm)))
-                                    break;
-                                snprintf(tt, sizeof(tt), "%.2f", b->temp);
-                                if (!tui_prompt("Temperature", tt, tt, sizeof(tt)))
-                                    break;
-                                ide_bot_t bot = {0};
-                                bot.id = b->id;
-                                bot.name = str_dup_trim(nn);
-                                bot.prompt = str_dup_trim(pp);
-                                bot.model = str_dup_trim(mm);
-                                bot.temp = atof(str_trim(tt));
-                                ide_bot_save(&bot);
-                                free(bot.name);
-                                free(bot.prompt);
-                                free(bot.model);
-                            }
-                        }
-                    }
-                } else if (ch == 'u') {
-                    char n3[256];
-                    if (tui_prompt("Use bot index", "", n3, sizeof(n3))) {
-                        int idx = atoi(str_trim(n3)) - 1;
-                        ide_bot_set_active(idx);
-                    }
-                } else if (ch == 'c') {
-                    if (ide_bots_active()) {
-                        ide_bot_set_active(-1);
-                        tui_alert("Bot application cancelled; using Settings.");
-                    }
-                } else if (ch == 'x') {
-                    char n4[256];
-                    if (tui_prompt("Delete bot index", "", n4, sizeof(n4))) {
-                        int idx = atoi(str_trim(n4)) - 1;
-                        ide_bot_delete(idx);
-                    }
-                } else if (ch == 'o') {
-                    char *json = ide_bots_export_json();
-                    char path[4096];
-                    char *def = xasprintf("%s/traliran-ide-bots.json", hub_dir());
-                    if (tui_prompt("Export bots to", def, path, sizeof(path))) {
-                        write_file(path, json);
-                        tui_alert("Bots exported.");
-                    }
-                    free(def);
-                    free(json);
-                } else if (ch == 'i') {
-                    char path[4096];
-                    if (tui_pick_file("Import bots JSON", path, sizeof(path))) {
-                        char *json = read_file(path);
-                        if (json) {
-                            if (ide_bots_import_json(json)) tui_alert("Bots imported.");
-                            else tui_alert("Invalid format.");
-                            free(json);
-                        }
-                    }
-                }
-                return;
-            }
             if (ed_key(&g_ide_editor, ch)) {
                 g_ide_editor.dirty = 1;
                 if (g_ide_active[0]) {
@@ -2773,6 +3077,20 @@ static void screen_ide_key(int ch) {
             }
             break;
     }
+}
+
+static void screen_ide_key(int ch) {
+    /* focus: 0 editor, 1 agent input, 2 left panel */
+    if (ch == KEY_F(11)) { ide_toggle_agentic(); return; }
+    if (g_ide_agentic_only) { ide_agent_key(ch); return; }
+    if (g_ide_focus == 1) { ide_agent_key(ch); return; }
+    if (g_ide_focus == 2) {
+        if (g_ide_left_tab == 0) ide_files_key(ch);
+        else if (g_ide_left_tab == 1) ide_git_key(ch);
+        else ide_bots_key(ch);
+        return;
+    }
+    ide_editor_key(ch);
 }
 
 /* =================== main loop =================== */
@@ -2841,19 +3159,19 @@ static void handle_key(int ch) {
     } else if (ch == '\t') {
         if (hotkey_gate(ch)) {
             g_screen = (screen_t)((g_screen + 1) % 6);
-            if (g_screen == SCREEN_IDE) g_ide_focus = 2;
+            if (g_screen == SCREEN_IDE) g_ide_focus = g_ide_agentic_only ? 1 : 2;
             return;
         }
     } else if (ch >= '1' && ch <= '6') {
         if (hotkey_gate(ch)) {
             g_screen = (screen_t)(ch - '1');
-            if (g_screen == SCREEN_IDE) g_ide_focus = 2;
+            if (g_screen == SCREEN_IDE) g_ide_focus = g_ide_agentic_only ? 1 : 2;
             return;
         }
     } else if (ch == KEY_CTRL('1')) { g_screen = SCREEN_CHAT; return; }
     else if (ch == KEY_CTRL('2')) { g_screen = SCREEN_NOTES; return; }
     else if (ch == KEY_CTRL('3')) { g_screen = SCREEN_STORE; return; }
-    else if (ch == KEY_CTRL('4')) { g_screen = SCREEN_IDE; g_ide_focus = 2; return; }
+    else if (ch == KEY_CTRL('4')) { g_screen = SCREEN_IDE; g_ide_focus = g_ide_agentic_only ? 1 : 2; return; }
     else if (ch == KEY_CTRL('5')) { g_screen = SCREEN_SETTINGS; return; }
     else if (ch == KEY_CTRL('6')) { g_screen = SCREEN_RAG; return; }
 
@@ -2874,17 +3192,18 @@ void app_run(void) {
     config_load();
     mcp_load();
     g_vim_mode = !strcmp(storage_get("gem_vim_mode"), "1");
+    g_ide_agentic_only = !strcmp(storage_get("gem_ide_agentic_only"), "1");
     chat_load(&g_chat);
     notes_load(&g_notes);
     store_init(&g_store);
     ide_init();
     ide_bots_reload();
     vc_load();
-    agent_chat_init(&g_agent_chat);
+    agent_sessions_load();
     mv_init(&g_agent_view);
     mv_init(&g_chat_view);
     mv_init(&g_note_preview_view);
-    rag_chat_init(&g_rag_chat);
+    rag_sessions_load();
     mv_init(&g_rag_view);
     progress_t prog = {0};
     pthread_mutex_init(&prog.mtx, NULL);

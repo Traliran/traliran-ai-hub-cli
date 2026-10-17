@@ -36,7 +36,7 @@ make clean
 ```sh
 ./traliran-hub
 ```
-On first run the app creates `~/.cache/traliran-cache/` (config/notes/sessions stored in `storage.json`) and a starter IDE workspace at `~/.cache/traliran-cache/workspace/`.
+On first run the app creates `~/.cache/traliran-cache/` (config/notes/sessions/docs stored in `storage.json`) and a starter IDE workspace at `~/.cache/traliran-cache/workspace/`. Extra IDE repositories are simply folders you pick (F2 GIT → `R`); commits and branches use your system `git`.
 
 1. Press **5** (Settings) → set your **Provider** and **API Key**, then **Fetch Models** and pick a model.
 2. Return to **Chat** (press **1**) and type a message.
@@ -48,11 +48,11 @@ On first run the app creates `~/.cache/traliran-cache/` (config/notes/sessions s
 | Global | **1..6** switch screens (or Tab / Ctrl+1..6) · `?` help · `q` quit · **F12 toggle Vim mode** |
 | Chat | Enter send · F2 new session · F3 rename · F4 delete · F5 summarize · F6 regenerate · F7 multi-model · F8 debate · F9 sandbox last code · F10 attach/remove file · Up/Down session · **PgUp/PgDn scroll messages** |
 | Notes | F2 new · F3 delete · F4 AI complement · F5 export MD · F6 export to RAG · F7 import MD · F8 preview · F9 search · F10 title · **PgUp/PgDn scroll note/preview** |
-| RAG | Enter send · F2 upload file (.md/.txt) · F3 delete · F4 export to Notes · Tab files/chat · Up/Down select · **PgUp/PgDn scroll chat** · F10 clear chat |
+| RAG | Enter send · F2 upload file (.md/.txt) · F3 delete · F4 export to Notes · **F5/F6 previous/next chat · F7 new chat · F8 rename · F9 delete** · F10 clear chat · Tab files/chat · Up/Down select · **PgUp/PgDn scroll chat** |
 | Store | Up/Down browse · Enter install free assistant · `o` open paid link |
-| IDE | F1 Files / F2 Versions / F3 Bots · F4 new file · F5 save · F9 commit · F10 revert · `x` delete · **PgUp/PgDn scroll editor** (agent panel: scrolls agent chat) · in Files list: **F1 to focus, Up/Down select, Enter open, PgUp/PgDn switch open tabs** · agent panel: Enter send, Tab switch focus |
+| IDE | F1 Files / F2 GIT / F3 Bots · F4 new file · F5 save · F6 preview · F7 export · F8 import · F9 commit · F10 revert · **F11 Agentic Only** · in Files: Up/Down select, Enter open, `r` rename, `n` new folder, `x` delete, PgUp/PgDn switch open tabs · in GIT: `b` new branch, `s` switch branch, `d` delete branch, `R` new repo, `c` switch repo, `D` delete repo · agent panel (focus): Enter send, **F2 new chat / F3 rename / F4 delete / F5 next / F6 previous** · Tab switch focus |
 
-Plain-character program hotkeys (`q`, `?`, `1..6`, Tab, IDE `x`) fire only after **3 rapid presses within 1 second**, so typing text never triggers them accidentally. F-keys and Ctrl combos fire immediately.
+Plain-character program hotkeys (`q`, `?`, `1..6`, Tab, IDE `x`/`r`/`n`) fire only after **3 rapid presses within 1 second**, so typing text never triggers them accidentally. F-keys and Ctrl combos fire immediately.
 | Settings | Up/Down select · Enter edit · Esc back |
 
 <img width="1903" height="977" alt="image" src="https://github.com/user-attachments/assets/1b3e1d8b-9699-4e0e-a961-f8d6be59a7a8" />
@@ -80,12 +80,15 @@ All data stays local — no cloud sync, serverless & privacy-first.
 *   **💡 Model Thinking Support:** Native rendering for reasoning models (like DeepSeek-R1). Structural thoughts are captured and organized into a clean, collapsible hidden dropdown block.
 *   **👥 AI Group Debate Mode:** Turn your raw ideas into fully analyzed concepts. Run a multi-agent discussion loop where specialized personas (Optimist, Critic, and Technologist) cross-examine your thesis over multiple rounds.
 *   **⚡ AI IDE - Integrated Development Environment:** A full-fledged terminal IDE for code generation, editing, and project management, powered by your chosen AI model.
-    *   **File Explorer:** Manage multiple project files (HTML, CSS, JS, etc.).
+    *   **Multi-Repository Workspaces:** Keep several independent projects, each mapped to a real folder on disk you pick. The active repo/branch is shown in the header (F2 GIT tab: `R` new repo, `c` switch, `D` delete).
+    *   **Real Git Version Control:** Commits, branches and reverts use the system `git` binary — the workspace folder is a genuine Git repository you can open with any Git tool.
+    *   **Branches:** Create/switch/delete branches (`b`/`s`/`d`); the commit list is filtered by the active branch and shows the short SHA.
+    *   **File Explorer:** Manage multiple project files (HTML, CSS, JS, etc.); create files and folders and rename paths manually (`r` rename, `n` new folder).
     *   **Code Editor:** Edit files with a full-screen text editor.
-    *   **Version Control:** Commit and revert snapshots of your workspace.
-    *   **AI Agent:** Run a persistent coding agent in the right-hand panel.
-    *   **Project Management:** Export your entire workspace as a `.tar.gz` archive.
-*   **🧠 RAG Knowledge Base:** A dedicated RAG screen where you upload `.md`/`.txt` documents, then chat with the AI which retrieves the relevant files on demand via tools (system-prompt JSON protocol, same as the IDE agent). Notes export straight into the RAG knowledge base, and any RAG document can be exported back into Notes.
+    *   **AI Agent:** Run a persistent coding agent in the right-hand panel with **multi-chat sessions** (F2 new · F3 rename · F4 delete · F5/F6 switch, auto-named from your first message).
+    *   **Agentic Only mode (F11):** Hide files and editor to focus purely on the agent chat.
+    *   **Project Management:** Export/import your entire workspace as a `.tar.gz` archive via the system `tar`.
+*   **🧠 RAG Knowledge Base:** A dedicated RAG screen where you upload `.md`/`.txt` documents, then chat with the AI which retrieves the relevant files on demand via tools (system-prompt JSON protocol, same as the IDE agent). RAG chats are multi-session too (F5/F6 switch · F7 new · F8 rename · F9 delete). Notes export straight into the RAG knowledge base, and any RAG document can be exported back into Notes.
 *   **💻 Built-in Sandbox Interpreter:** Execute, preview, and test generated HTML/JS/CSS code snippets locally without leaving the main chat workspace.
 *   **🏪 Assistant Store:** Access a marketplace of free and premium, highly-optimized AI assistant presets and custom prompts for various tasks (e.g., Polyglot Translator, Code & Text Editor, Ideation Generator).
 *   **⚙️ Advanced Parameters Control:** Fine-tune system behaviors with on-the-fly adjustable Temperature, Top P, and Max Tokens configuration.

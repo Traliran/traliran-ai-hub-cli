@@ -1,5 +1,6 @@
 /*
- * rag.h - knowledge base (RAG) management, mirrors web gem_rag_kb store.
+ * rag.h - knowledge base (RAG) management, mirrors web gem_rag_kb store,
+ * plus multi-chat RAG agent sessions (gem_rag_sessions).
  */
 #ifndef HUB_RAG_H
 #define HUB_RAG_H
@@ -8,6 +9,7 @@
 #include <stdbool.h>
 
 #include "notes.h"
+#include "sessions.h"
 
 typedef struct {
     char *name;
@@ -28,22 +30,22 @@ void   kb_remove(kb_t *kb, int idx);
 char  *kb_build_context(const kb_t *kb);   /* markdown context for system prompt */
 bool   kb_add_file(kb_t *kb, const char *path);                 /* .md/.txt only */
 
-/* ---------- RAG agent chat ---------- */
-typedef struct {
-    char *role;
-    char *content;
-} rag_msg_t;
+/* ---------- RAG agent chat (message log) ---------- */
+typedef chatlog_t rag_chat_t;
 
-typedef struct {
-    rag_msg_t     *msgs;
-    int            n;
-    pthread_mutex_t mtx;
-} rag_chat_t;
-
-void  rag_chat_init(rag_chat_t *c);
-void  rag_chat_free(rag_chat_t *c);
-void  rag_chat_clear(rag_chat_t *c);
-char *rag_chat_snapshot(rag_chat_t *c);    /* rendered-ish plain text */
+/* ---------- RAG multi-chat sessions ---------- */
+void        rag_sessions_load(void);
+void        rag_sessions_save(void);
+int         rag_sessions_count(void);
+const char *rag_session_name(int idx);
+int         rag_session_current(void);
+void        rag_session_new(void);
+void        rag_session_select(int idx);
+void        rag_session_rename(int idx, const char *name);
+void        rag_session_delete(int idx);
+void        rag_session_autoname(const char *text);
+void        rag_session_clear(void);
+rag_chat_t *rag_session_chat(void);        /* active log or NULL */
 
 /* run the RAG agent tool-loop (blocking; call from worker thread) */
 typedef struct {

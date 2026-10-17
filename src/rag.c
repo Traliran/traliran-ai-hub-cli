@@ -121,51 +121,25 @@ bool kb_add_file(kb_t *kb, const char *path) {
     return true;
 }
 
-/* =================== RAG agent chat =================== */
+/* =================== RAG agent chat sessions =================== */
 
-void rag_chat_init(rag_chat_t *c) {
-    memset(c, 0, sizeof(*c));
-    pthread_mutex_init(&c->mtx, NULL);
-}
+static session_store_t g_rag_sessions;
 
-void rag_chat_free(rag_chat_t *c) {
-    pthread_mutex_destroy(&c->mtx);
-    rag_chat_clear(c);
-}
-
-void rag_chat_clear(rag_chat_t *c) {
-    pthread_mutex_lock(&c->mtx);
-    for (int i = 0; i < c->n; i++) {
-        free(c->msgs[i].role);
-        free(c->msgs[i].content);
-    }
-    free(c->msgs);
-    c->msgs = NULL;
-    c->n = 0;
-    pthread_mutex_unlock(&c->mtx);
-}
+void rag_sessions_load(void) { session_store_init(&g_rag_sessions, "gem_rag_sessions"); session_store_load(&g_rag_sessions); }
+void rag_sessions_save(void) { session_store_save(&g_rag_sessions); }
+int  rag_sessions_count(void) { return session_store_count(&g_rag_sessions); }
+const char *rag_session_name(int idx) { return session_store_name(&g_rag_sessions, idx); }
+int  rag_session_current(void) { return session_store_current(&g_rag_sessions); }
+void rag_session_new(void) { session_store_new(&g_rag_sessions); }
+void rag_session_select(int idx) { session_store_select(&g_rag_sessions, idx); }
+void rag_session_rename(int idx, const char *name) { session_store_rename(&g_rag_sessions, idx, name); }
+void rag_session_delete(int idx) { session_store_delete(&g_rag_sessions, idx); }
+void rag_session_autoname(const char *text) { session_store_autoname(&g_rag_sessions, text); }
+void rag_session_clear(void) { session_store_clear(&g_rag_sessions); }
+rag_chat_t *rag_session_chat(void) { return session_store_chat(&g_rag_sessions); }
 
 static void rag_chat_push(rag_chat_t *c, const char *role, const char *content) {
-    pthread_mutex_lock(&c->mtx);
-    c->msgs = realloc(c->msgs, sizeof(rag_msg_t) * (size_t)(c->n + 1));
-    c->msgs[c->n].role = xstrdup(role);
-    c->msgs[c->n].content = xstrdup(content);
-    c->n++;
-    pthread_mutex_unlock(&c->mtx);
-}
-
-char *rag_chat_snapshot(rag_chat_t *c) {
-    pthread_mutex_lock(&c->mtx);
-    sbuf_t b;
-    sbuf_init(&b);
-    for (int i = 0; i < c->n; i++) {
-        sbuf_appendf(&b, "[%s] %s\n", c->msgs[i].role, c->msgs[i].content);
-        sbuf_append(&b, "\n");
-    }
-    pthread_mutex_unlock(&c->mtx);
-    char *out = sbuf_detach(&b);
-    sbuf_free(&b);
-    return out;
+    chatlog_push(c, role, content);
 }
 
 /* =================== RAG agent tools =================== */

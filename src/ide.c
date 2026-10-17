@@ -1,5 +1,6 @@
 /*
- * ide.c - AI IDE: VFS on disk, version control, custom bots, agent tools.
+ * ide.c - AI IDE: VFS on disk, multi-repository workspaces, real-git version
+ * control, custom bots, agent tools, and multi-chat agent sessions.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -17,79 +18,241 @@
 #include "storage.h"
 #include "config.h"
 #include "chat.h"
+#include "sessions.h"
 #include "ide.h"
+
+static void vc_delete_branch_commits(const char *branch);
+
+/* =================== repositories =================== */
+
+typedef struct {
+    char      *id;
+    char      *name;
+    char      *path;      /* absolute folder on disk */
+    long long  created;
+} repo_t;
+
+static repo_t *g_repos = NULL;
+static int     g_nrepos = 0;
+static int     g_cur = 0;
+
+static char g_active_repo_id[64] = "";
+static char g_active_path[4096] = "";
+
+const char *ide_repo_active_path(void) {
+    return g_active_path[0] ? g_active_path : hub_workspace_dir();
+}
+
+static char *commits_key(const char *repo_id) {
+    return xasprintf("ide_repo_%s_commits", repo_id);
+}
+
+static void repos_save_index(void) {
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < g_nrepos; i++) {
+        cJSON *j = cJSON_CreateObject();
+        cJSON_AddStringToObject(j, "id", g_repos[i].id);
+        cJSON_AddStringToObject(j, "name", g_repos[i].name);
+        cJSON_AddStringToObject(j, "path", g_repos[i].path);
+        cJSON_AddNumberToObject(j, "createdAt", (double)g_repos[i].created);
+        cJSON_AddItemToArray(arr, j);
+    }
+    char *json = cJSON_PrintUnformatted(arr);
+    if (json) {
+        storage_set("ide_repos_index", json);
+        free(json);
+    }
+    cJSON_Delete(arr);
+}
+
+static void repos_free(void) {
+    for (int i = 0; i < g_nrepos; i++) {
+        free(g_repos[i].id);
+        free(g_repos[i].name);
+        free(g_repos[i].path);
+    }
+    free(g_repos);
+    g_repos = NULL;
+    g_nrepos = 0;
+}
+
+static void repos_set_active(int idx) {
+    if (idx < 0 || idx >= g_nrepos) return;
+    g_cur = idx;
+    snprintf(g_active_repo_id, sizeof(g_active_repo_id), "%s", g_repos[idx].id);
+    snprintf(g_active_path, sizeof(g_active_path), "%s", g_repos[idx].path);
+    storage_set("ide_active_repo_id", g_active_repo_id);
+    mkdir_p(g_active_path);
+}
+
+/* Legacy single-workspace installs are migrated into a "main" repository that
+ * keeps pointing at the historical workspace folder, so no files ever move. */
+static void repos_migrate_legacy(void) {
+    g_repos = calloc(1, sizeof(repo_t));
+    g_repos[0].id = xstrdup("repo_main");
+    g_repos[0].name = xstrdup("main");
+    g_repos[0].path = xstrdup(hub_workspace_dir());
+    g_repos[0].created = now_ms();
+    g_nrepos = 1;
+    repos_save_index();
+    storage_set("ide_active_repo_id", "repo_main");
+    /* Bring the old snapshot commits into the per-repo key once. */
+    char *ck = commits_key("repo_main");
+    if (!storage_get(ck)[0]) {
+        const char *legacy = storage_get("ide_vfs_commits");
+        if (legacy[0]) storage_set(ck, legacy);
+    }
+    free(ck);
+}
+
+void ide_repos_load(void) {
+    repos_free();
+    const char *raw = storage_get("ide_repos_index");
+    if (raw[0]) {
+        cJSON *arr = cJSON_Parse(raw);
+        if (arr && cJSON_IsArray(arr)) {
+            int n = cJSON_GetArraySize(arr);
+            for (int i = 0; i < n; i++) {
+                cJSON *j = cJSON_GetArrayItem(arr, i);
+                cJSON *id = cJSON_GetObjectItem(j, "id");
+                cJSON *name = cJSON_GetObjectItem(j, "name");
+                cJSON *path = cJSON_GetObjectItem(j, "path");
+                cJSON *created = cJSON_GetObjectItem(j, "createdAt");
+                if (!id || !id->valuestring || !path || !path->valuestring) continue;
+                g_repos = realloc(g_repos, sizeof(repo_t) * (size_t)(g_nrepos + 1));
+                g_repos[g_nrepos].id = xstrdup(id->valuestring);
+                g_repos[g_nrepos].name = xstrdup(name && name->valuestring ? name->valuestring : id->valuestring);
+                g_repos[g_nrepos].path = xstrdup(path->valuestring);
+                g_repos[g_nrepos].created = created && cJSON_IsNumber(created) ? (long long)created->valuedouble : now_ms();
+                g_nrepos++;
+            }
+        }
+        if (arr) cJSON_Delete(arr);
+    }
+    if (g_nrepos == 0) repos_migrate_legacy();
+
+    char active[64];
+    snprintf(active, sizeof(active), "%s", storage_get("ide_active_repo_id"));
+    int idx = -1;
+    for (int i = 0; i < g_nrepos; i++)
+        if (!strcmp(g_repos[i].id, active)) { idx = i; break; }
+    repos_set_active(idx >= 0 ? idx : 0);
+}
+
+int ide_repos_count(void) { return g_nrepos; }
+
+const char *ide_repo_name(int idx) {
+    return (idx >= 0 && idx < g_nrepos) ? g_repos[idx].name : "";
+}
+
+const char *ide_repo_path(int idx) {
+    return (idx >= 0 && idx < g_nrepos) ? g_repos[idx].path : "";
+}
+
+int ide_repo_active_index(void) { return g_cur; }
+
+void ide_repo_create(const char *name, const char *path) {
+    if (!path || path[0] != '/') return;
+    char clean[64];
+    snprintf(clean, sizeof(clean), "%s", name ? name : "");
+    str_trim(clean);
+    if (!clean[0]) snprintf(clean, sizeof(clean), "repo-%d", g_nrepos + 1);
+
+    char id[64];
+    snprintf(id, sizeof(id), "repo_%lld", (long long)now_ms());
+    g_repos = realloc(g_repos, sizeof(repo_t) * (size_t)(g_nrepos + 1));
+    g_repos[g_nrepos].id = xstrdup(id);
+    g_repos[g_nrepos].name = xstrdup(clean);
+    g_repos[g_nrepos].path = xstrdup(path);
+    g_repos[g_nrepos].created = now_ms();
+    g_nrepos++;
+    mkdir_p(path);
+    repos_save_index();
+    repos_set_active(g_nrepos - 1);
+    vc_load();
+    storage_save();
+}
+
+void ide_repo_switch(int idx) {
+    if (idx < 0 || idx >= g_nrepos || idx == g_cur) return;
+    repos_set_active(idx);
+    vc_load();
+    storage_save();
+}
+
+void ide_repo_remove(int idx) {
+    if (idx < 0 || idx >= g_nrepos || g_nrepos <= 1) return;
+    /* Forget the repository; the folder on disk (and its git history) is kept. */
+    char *ck = commits_key(g_repos[idx].id);
+    storage_remove(ck);
+    free(ck);
+    free(g_repos[idx].id);
+    free(g_repos[idx].name);
+    free(g_repos[idx].path);
+    for (int i = idx; i < g_nrepos - 1; i++) g_repos[i] = g_repos[i + 1];
+    g_nrepos--;
+    repos_save_index();
+    repos_set_active(g_cur >= g_nrepos ? g_nrepos - 1 : g_cur);
+    vc_load();
+    storage_save();
+}
 
 /* =================== VFS =================== */
 
 static char *ws_path(const char *rel) {
-    /* returns malloc'd full path; NULL if unsafe */
+    /* returns malloc'd full path inside the active repo; NULL if unsafe */
     if (!rel) return NULL;
     if (strstr(rel, "..") || rel[0] == '/') return NULL;
     if (rel[0] == '\0') return NULL;
-    return xasprintf("%s/%s", hub_workspace_dir(), rel);
+    if (!strcmp(rel, ".git") || str_has_prefix(rel, ".git/")) return NULL;
+    return xasprintf("%s/%s", ide_repo_active_path(), rel);
 }
 
-void ide_init(void) {
-    ensure_dirs();
-    int n = 0;
-    char **list = ide_list_files(&n);
-    if (n == 0) {
-        ide_write_file("README.md", "# Welcome to Traliran AI IDE\n\nStart coding! The AI agent can help you.\n");
-        ide_write_file("index.html", "<!DOCTYPE html>\n<html>\n<head>\n    <title>My App</title>\n</head>\n<body>\n    <h1>Hello World</h1>\n    <script src=\"app.js\"></script>\n</body>\n</html>\n");
-        ide_write_file("app.js", "// Your JavaScript code here\nconsole.log(\"Hello from AI IDE!\");\n");
-        ide_write_file("styles.css", "/* Your styles here */\nbody {\n    font-family: system-ui;\n    margin: 2rem;\n}\n");
+static void add_file(char ***files, int *n, int *cap, const char *path) {
+    if (*n >= *cap) {
+        *cap = *cap ? (*cap) * 2 : 64;
+        *files = realloc(*files, sizeof(char *) * (size_t)*cap);
     }
-    ide_free_list(list, n);
+    (*files)[(*n)++] = xstrdup(path);
 }
 
-char **ide_list_files(int *n_out) {
-    /* recursive walk */
-    char **files = NULL;
-    int n = 0;
-    /* simple stack-free recursion via helper */
-    /* collect via opendir walk */
-    /* use a helper that appends relative paths */
-    /* simpler: walk with recursion using index-based approach */
-    const char *base = hub_workspace_dir();
-    DIR *d = opendir(base);
-    if (!d) { *n_out = 0; return NULL; }
+/* Recursively collect regular files (relative paths); .git/ is never listed. */
+static void walk_dir(const char *base, const char *rel, char ***files, int *n, int *cap, int depth) {
+    if (depth > 32) return;
+    char dir[4600];
+    if (rel[0]) snprintf(dir, sizeof(dir), "%s/%s", base, rel);
+    else         snprintf(dir, sizeof(dir), "%s", base);
+    DIR *d = opendir(dir);
+    if (!d) return;
     struct dirent *de;
     while ((de = readdir(d))) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-        char full[4200];
-        snprintf(full, sizeof(full), "%s/%s", base, de->d_name);
+        if (!strcmp(de->d_name, ".git")) continue;
+        char child[4600];
+        if (rel[0]) snprintf(child, sizeof(child), "%s/%s", rel, de->d_name);
+        else        snprintf(child, sizeof(child), "%s", de->d_name);
+        char full[4600];
+        snprintf(full, sizeof(full), "%s/%s", base, child);
         struct stat st;
         if (stat(full, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
-            DIR *sub = opendir(full);
-            if (sub) {
-                struct dirent *sde;
-                while ((sde = readdir(sub))) {
-                    if (!strcmp(sde->d_name, ".") || !strcmp(sde->d_name, "..")) continue;
-                    char subfull[4600];
-                    snprintf(subfull, sizeof(subfull), "%.*s/%.*s",
-                             (int)sizeof(subfull) - 1, full,
-                             (int)sizeof(subfull) - 1, sde->d_name);
-                    struct stat sst;
-                    if (stat(subfull, &sst) == 0 && S_ISREG(sst.st_mode)) {
-                        files = realloc(files, sizeof(char *) * (size_t)(n + 1));
-                        files[n++] = xasprintf("%s/%s", de->d_name, sde->d_name);
-                    }
-                }
-                closedir(sub);
-            }
+            walk_dir(base, child, files, n, cap, depth + 1);
         } else if (S_ISREG(st.st_mode)) {
-            files = realloc(files, sizeof(char *) * (size_t)(n + 1));
-            files[n++] = xstrdup(de->d_name);
+            add_file(files, n, cap, child);
         }
     }
     closedir(d);
-    /* sort */
-    for (int i = 0; i < n; i++)
-        for (int j = i + 1; j < n; j++)
-            if (strcmp(files[i], files[j]) > 0) {
-                char *t = files[i]; files[i] = files[j]; files[j] = t;
-            }
+}
+
+static int cmp_str(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+char **ide_list_files(int *n_out) {
+    char **files = NULL;
+    int n = 0, cap = 0;
+    walk_dir(ide_repo_active_path(), "", &files, &n, &cap, 0);
+    if (n > 1) qsort(files, (size_t)n, sizeof(char *), cmp_str);
     *n_out = n;
     return files;
 }
@@ -110,7 +273,6 @@ char *ide_read_file(const char *path) {
 bool ide_write_file(const char *path, const char *content) {
     char *full = ws_path(path);
     if (!full) return false;
-    /* ensure parent dirs exist */
     char *slash = strrchr(full, '/');
     if (slash && slash != full) {
         *slash = '\0';
@@ -131,7 +293,6 @@ bool ide_delete_file(const char *path) {
 }
 
 bool ide_delete_folder(const char *path) {
-    /* delete every file whose path starts with path/ */
     int n = 0;
     char **list = ide_list_files(&n);
     bool any = false;
@@ -176,8 +337,71 @@ bool ide_new_file(const char *path) {
     char *full = ws_path(path);
     if (!full) return false;
     if (file_exists(full)) { free(full); return false; }
+    char *slash = strrchr(full, '/');
+    if (slash && slash != full) {
+        *slash = '\0';
+        mkdir_p(full);
+        *slash = '/';
+    }
     bool ok = write_file(full, "");
     free(full);
+    return ok;
+}
+
+/* Create a folder inside the active repository (empty folders stay invisible to
+ * the flat file list until they hold files, which is fine for the CLI tree). */
+bool ide_new_folder(const char *path) {
+    char *full = ws_path(path);
+    if (!full) return false;
+    bool ok = mkdir_p(full);
+    free(full);
+    return ok;
+}
+
+/* Normalize a user-supplied VFS path (trim, forward slashes, no leading/trailing). */
+static char *normalize_vfs_path(const char *path) {
+    if (!path) return NULL;
+    char *s = xstrdup(path);
+    str_trim(s);
+    for (char *p = s; *p; p++) if (*p == '\\') *p = '/';
+    char *start = s;
+    while (*start == '/') start++;
+    size_t len = strlen(start);
+    while (len > 0 && start[len - 1] == '/') start[--len] = '\0';
+    char *out = xstrdup(start);
+    free(s);
+    if (!out[0] || strstr(out, "..") || !strcmp(out, ".git") || str_has_prefix(out, ".git/")) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
+bool ide_rename_path(const char *old_path, const char *new_path) {
+    char *from = normalize_vfs_path(old_path);
+    char *to = normalize_vfs_path(new_path);
+    if (!from || !to) { free(from); free(to); return false; }
+    if (!strcmp(from, to)) { free(from); free(to); return true; }
+
+    char *ofull = ws_path(from);
+    char *nfull = ws_path(to);
+    free(from);
+    free(to);
+    if (!ofull || !nfull) { free(ofull); free(nfull); return false; }
+
+    struct stat st;
+    if (stat(ofull, &st) != 0) { free(ofull); free(nfull); return false; }
+    if (file_exists(nfull)) { free(ofull); free(nfull); return false; }
+
+    char *slash = strrchr(nfull, '/');
+    if (slash && slash != nfull) {
+        *slash = '\0';
+        mkdir_p(nfull);
+        *slash = '/';
+    }
+    bool ok = (rename(ofull, nfull) == 0);
+    free(ofull);
+    free(nfull);
     return ok;
 }
 
@@ -195,24 +419,249 @@ char *ide_file_tree_text(void) {
     return sbuf_detach(&b);
 }
 
+/* =================== shell / git helpers =================== */
+
 static bool run_cmd(const char *fmt, ...) {
-    char cmd[4096];
+    char cmd[8192];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(cmd, sizeof(cmd), fmt, ap);
     va_end(ap);
-    int rc = system(cmd);
-    return rc == 0;
+    return system(cmd) == 0;
+}
+
+/* Single-quote a string for safe use inside a shell command. */
+static char *shq(const char *s) {
+    sbuf_t b;
+    sbuf_init(&b);
+    sbuf_append(&b, "'");
+    for (const char *p = s ? s : ""; *p; p++) {
+        if (*p == '\'') sbuf_append(&b, "'\\''");
+        else sbuf_append_n(&b, p, 1);
+    }
+    sbuf_append(&b, "'");
+    return sbuf_detach(&b);
+}
+
+/* Run a command and capture trimmed stdout; NULL on failure. */
+static char *run_capture(const char *fmt, ...) {
+    char cmd[8192];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(cmd, sizeof(cmd), fmt, ap);
+    va_end(ap);
+    FILE *f = popen(cmd, "r");
+    if (!f) return NULL;
+    sbuf_t b;
+    sbuf_init(&b);
+    char buf[512];
+    size_t r;
+    while ((r = fread(buf, 1, sizeof(buf), f)) > 0) sbuf_append_n(&b, buf, r);
+    int rc = pclose(f);
+    if (rc != 0) { sbuf_free(&b); return NULL; }
+    char *s = sbuf_detach(&b);
+    str_trim(s);
+    return s;
+}
+
+static bool g_git_checked = false;
+static bool g_git_ok = false;
+
+bool ide_git_available(void) {
+    if (!g_git_checked) {
+        g_git_ok = (system("command -v git >/dev/null 2>&1") == 0);
+        g_git_checked = true;
+    }
+    return g_git_ok;
+}
+
+static bool git_ensure_repo(const char *dir) {
+    char *gitdir = xasprintf("%s/.git", dir);
+    bool ok = true;
+    if (!file_exists(gitdir)) {
+        char *d = shq(dir);
+        /* Force "main" like the web IDE so commit metadata and branches line up. */
+        ok = run_cmd("git -C %s -c init.defaultBranch=main init -q >/dev/null 2>&1", d);
+        free(d);
+    }
+    free(gitdir);
+    return ok;
+}
+
+/* Commit the current working tree. Returns the commit sha and branch name. */
+static bool git_commit(const char *dir, const char *msg, char *sha, size_t shasz, char *branch, size_t brsz) {
+    if (!ide_git_available() || !git_ensure_repo(dir)) return false;
+    char *d = shq(dir);
+    char *m = shq(msg && msg[0] ? msg : "Untitled commit");
+    run_cmd("git -C %s add -A >/dev/null 2>&1", d);
+    bool committed = run_cmd(
+        "git -C %s -c user.name='Traliran IDE' -c user.email='ide@traliran.local' "
+        "-c commit.gpgsign=false commit -q --allow-empty -m %s >/dev/null 2>&1", d, m);
+    free(d);
+    free(m);
+    if (!committed) return false;
+    char *dd = shq(dir);
+    char *s = run_capture("git -C %s rev-parse HEAD 2>/dev/null", dd);
+    char *b = run_capture("git -C %s rev-parse --abbrev-ref HEAD 2>/dev/null", dd);
+    free(dd);
+    if (s && s[0]) snprintf(sha, shasz, "%s", s);
+    if (b && b[0]) snprintf(branch, brsz, "%s", b);
+    bool ok = (s && s[0]);
+    free(s);
+    free(b);
+    return ok;
+}
+
+static char *sanitize_branch(const char *name) {
+    if (!name) return NULL;
+    sbuf_t b;
+    sbuf_init(&b);
+    for (const char *p = name; *p; p++) {
+        char c = *p;
+        if (isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.' || c == '/')
+            sbuf_append_n(&b, p, 1);
+        else
+            sbuf_append(&b, "-");
+    }
+    char *s = sbuf_detach(&b);
+    char *t = str_trim(s);
+    char *out = xstrdup(t);
+    free(s);
+    if (!out[0]) { free(out); return NULL; }
+    return out;
+}
+
+char *ide_branch_current(void) {
+    if (!ide_git_available()) return xstrdup("main");
+    char *d = shq(g_active_path);
+    char *b = run_capture("git -C %s rev-parse --abbrev-ref HEAD 2>/dev/null", d);
+    free(d);
+    if (!b || !b[0] || !strcmp(b, "HEAD")) { free(b); return xstrdup("main"); }
+    return b;
+}
+
+static char **split_lines(const char *text, int *n_out) {
+    char **list = NULL;
+    int n = 0, cap = 0;
+    const char *p = text;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        char *line = xstrndup(p, len);
+        str_trim(line);
+        if (line[0]) {
+            if (n >= cap) { cap = cap ? cap * 2 : 16; list = realloc(list, sizeof(char *) * (size_t)cap); }
+            list[n++] = line;
+        } else free(line);
+        if (!nl) break;
+        p = nl + 1;
+    }
+    *n_out = n;
+    return list;
+}
+
+char **ide_branch_list(int *n_out) {
+    *n_out = 0;
+    if (!ide_git_available()) return NULL;
+    char *d = shq(g_active_path);
+    char *out = run_capture("git -C %s branch --format=%%(refname:short) 2>/dev/null", d);
+    free(d);
+    char **list = NULL;
+    int n = 0;
+    if (out) {
+        list = split_lines(out, &n);
+        free(out);
+    }
+    if (n == 0) {
+        list = calloc(1, sizeof(char *));
+        list[0] = ide_branch_current();
+        n = 1;
+    }
+    *n_out = n;
+    return list;
+}
+
+void ide_branch_free_list(char **list, int n) {
+    for (int i = 0; i < n; i++) free(list[i]);
+    free(list);
+}
+
+bool ide_branch_create(const char *name) {
+    if (!ide_git_available() || !git_ensure_repo(g_active_path)) return false;
+    char *bn = sanitize_branch(name);
+    if (!bn) return false;
+    char *d = shq(g_active_path);
+    char *q = shq(bn);
+    bool ok = run_cmd("git -C %s checkout -q -b %s >/dev/null 2>&1", d, q);
+    free(d);
+    free(q);
+    free(bn);
+    if (ok) vc_load();
+    return ok;
+}
+
+bool ide_branch_switch(const char *name) {
+    if (!ide_git_available()) return false;
+    char *bn = sanitize_branch(name);
+    if (!bn) return false;
+    char *d = shq(g_active_path);
+    char *q = shq(bn);
+    bool ok = run_cmd("git -C %s checkout -q %s >/dev/null 2>&1", d, q);
+    free(d);
+    free(q);
+    free(bn);
+    if (ok) vc_load();
+    return ok;
+}
+
+bool ide_branch_delete(const char *name) {
+    if (!ide_git_available()) return false;
+    char *bn = sanitize_branch(name);
+    if (!bn) return false;
+
+    int n = 0;
+    char **list = ide_branch_list(&n);
+    bool found = false;
+    for (int i = 0; i < n; i++) if (!strcmp(list[i], bn)) found = true;
+    if (n <= 1 || !found) { ide_branch_free_list(list, n); free(bn); return false; }
+
+    /* Git refuses to delete the checked-out branch: move off it first. */
+    char *cur = ide_branch_current();
+    if (!strcmp(cur, bn)) {
+        for (int i = 0; i < n; i++) {
+            if (strcmp(list[i], bn) != 0) {
+                char *d = shq(g_active_path);
+                char *q = shq(list[i]);
+                run_cmd("git -C %s checkout -q %s >/dev/null 2>&1", d, q);
+                free(d);
+                free(q);
+                break;
+            }
+        }
+    }
+    free(cur);
+    ide_branch_free_list(list, n);
+
+    /* Drop the stored commit metadata bound to that branch (like the web IDE). */
+    vc_delete_branch_commits(bn);
+
+    char *d = shq(g_active_path);
+    char *q = shq(bn);
+    bool ok = run_cmd("git -C %s branch -q -D %s >/dev/null 2>&1", d, q);
+    free(d);
+    free(q);
+    free(bn);
+    if (ok) vc_load();
+    return ok;
 }
 
 bool ide_export_project(const char *path) {
-    return run_cmd("tar -czf \"%s\" -C \"%s\" .", path, hub_workspace_dir());
+    return run_cmd("tar -czf \"%s\" -C \"%s\" .", path, ide_repo_active_path());
 }
 
 bool ide_import_project(const char *path) {
-    /* clean workspace then extract */
-    run_cmd("find \"%s\" -mindepth 1 -delete", hub_workspace_dir());
-    return run_cmd("tar -xzf \"%s\" -C \"%s\"", path, hub_workspace_dir());
+    /* Extract over the current repository folder (existing files are kept). */
+    return run_cmd("tar -xzf \"%s\" -C \"%s\"", path, ide_repo_active_path());
 }
 
 /* =================== version control =================== */
@@ -221,68 +670,27 @@ typedef struct {
     char   *id;
     char   *message;
     long long ts;
-    cJSON  *snapshot;
+    char   *branch;
+    char   *sha;        /* git sha when the commit was made through git */
+    int     nfiles;
+    cJSON  *snapshot;   /* fallback when git is unavailable, else NULL */
 } commit_t;
 
 static commit_t *g_commits = NULL;
 static int g_ncommits = 0;
+static int *g_vis = NULL;          /* indices of commits visible on the active branch */
+static int g_nvis = 0;
 static pthread_mutex_t g_vc_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-static void vc_save_storage(void) {
-    cJSON *arr = cJSON_CreateArray();
-    for (int i = 0; i < g_ncommits; i++) {
-        cJSON *j = cJSON_CreateObject();
-        cJSON_AddStringToObject(j, "id", g_commits[i].id);
-        cJSON_AddStringToObject(j, "message", g_commits[i].message);
-        cJSON_AddNumberToObject(j, "timestamp", (double)g_commits[i].ts);
-        cJSON_AddItemToObject(j, "snapshot", cJSON_Duplicate(g_commits[i].snapshot, 1));
-        cJSON_AddItemToArray(arr, j);
-    }
-    char *json = cJSON_PrintUnformatted(arr);
-    if (json) {
-        storage_set("ide_vfs_commits", json);
-        free(json);
-    }
-    cJSON_Delete(arr);
+static void commit_free(commit_t *c) {
+    free(c->id);
+    free(c->message);
+    free(c->branch);
+    free(c->sha);
+    if (c->snapshot) cJSON_Delete(c->snapshot);
 }
 
-void vc_load(void) {
-    pthread_mutex_lock(&g_vc_mtx);
-    for (int i = 0; i < g_ncommits; i++) {
-        free(g_commits[i].id);
-        free(g_commits[i].message);
-        cJSON_Delete(g_commits[i].snapshot);
-    }
-    free(g_commits);
-    g_commits = NULL;
-    g_ncommits = 0;
-
-    const char *raw = storage_get("ide_vfs_commits");
-    if (raw[0]) {
-        cJSON *arr = cJSON_Parse(raw);
-        if (arr && cJSON_IsArray(arr)) {
-            int n = cJSON_GetArraySize(arr);
-            for (int i = 0; i < n; i++) {
-                cJSON *j = cJSON_GetArrayItem(arr, i);
-                cJSON *id = cJSON_GetObjectItem(j, "id");
-                cJSON *msg = cJSON_GetObjectItem(j, "message");
-                cJSON *ts = cJSON_GetObjectItem(j, "timestamp");
-                cJSON *snap = cJSON_GetObjectItem(j, "snapshot");
-                g_commits = realloc(g_commits, sizeof(commit_t) * (size_t)(g_ncommits + 1));
-                g_commits[g_ncommits].id = xstrdup(id && id->valuestring ? id->valuestring : "commit");
-                g_commits[g_ncommits].message = xstrdup(msg && msg->valuestring ? msg->valuestring : "Untitled commit");
-                g_commits[g_ncommits].ts = ts && cJSON_IsNumber(ts) ? (long long)ts->valuedouble : now_ms();
-                g_commits[g_ncommits].snapshot = snap ? cJSON_Duplicate(snap, 1) : cJSON_CreateObject();
-                g_ncommits++;
-            }
-        }
-        if (arr) cJSON_Delete(arr);
-    }
-    pthread_mutex_unlock(&g_vc_mtx);
-}
-
-void vc_create_commit(const char *message) {
-    pthread_mutex_lock(&g_vc_mtx);
+static cJSON *make_snapshot(void) {
     cJSON *snap = cJSON_CreateObject();
     int n = 0;
     char **files = ide_list_files(&n);
@@ -294,15 +702,122 @@ void vc_create_commit(const char *message) {
         }
     }
     ide_free_list(files, n);
+    return snap;
+}
+
+static void vc_rebuild_visible(void) {
+    free(g_vis);
+    g_vis = NULL;
+    g_nvis = 0;
+    char *cur = ide_branch_current();
+    int cap = 0;
+    for (int i = 0; i < g_ncommits; i++) {
+        const char *branch = g_commits[i].branch ? g_commits[i].branch : "main";
+        if (strcmp(branch, cur) != 0) continue;
+        if (g_nvis >= cap) { cap = cap ? cap * 2 : 16; g_vis = realloc(g_vis, sizeof(int) * (size_t)cap); }
+        g_vis[g_nvis++] = i;
+    }
+    free(cur);
+}
+
+static void vc_save_storage(void) {
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < g_ncommits; i++) {
+        commit_t *c = &g_commits[i];
+        cJSON *j = cJSON_CreateObject();
+        cJSON_AddStringToObject(j, "id", c->id);
+        cJSON_AddStringToObject(j, "message", c->message);
+        cJSON_AddNumberToObject(j, "timestamp", (double)c->ts);
+        cJSON_AddStringToObject(j, "branch", c->branch ? c->branch : "main");
+        if (c->sha) cJSON_AddStringToObject(j, "sha", c->sha);
+        cJSON_AddNumberToObject(j, "nfiles", c->nfiles);
+        if (c->snapshot) cJSON_AddItemToObject(j, "snapshot", cJSON_Duplicate(c->snapshot, 1));
+        cJSON_AddItemToArray(arr, j);
+    }
+    char *json = cJSON_PrintUnformatted(arr);
+    if (json) {
+        char *ck = commits_key(g_active_repo_id);
+        storage_set(ck, json);
+        storage_set("ide_vfs_commits", json);   /* legacy mirror */
+        free(ck);
+        free(json);
+    }
+    cJSON_Delete(arr);
+}
+
+void vc_load(void) {
+    pthread_mutex_lock(&g_vc_mtx);
+    for (int i = 0; i < g_ncommits; i++) commit_free(&g_commits[i]);
+    free(g_commits);
+    g_commits = NULL;
+    g_ncommits = 0;
+
+    char *ck = commits_key(g_active_repo_id);
+    const char *raw = storage_get(ck);
+    char *copy = xstrdup(raw);
+    free(ck);
+    /* Legacy single-workspace commits are only adopted by the main repository. */
+    if (!copy[0] && !strcmp(g_active_repo_id, "repo_main")) {
+        free(copy);
+        copy = xstrdup(storage_get("ide_vfs_commits"));
+    }
+
+    if (copy[0]) {
+        cJSON *arr = cJSON_Parse(copy);
+        if (arr && cJSON_IsArray(arr)) {
+            int n = cJSON_GetArraySize(arr);
+            for (int i = 0; i < n; i++) {
+                cJSON *j = cJSON_GetArrayItem(arr, i);
+                cJSON *id = cJSON_GetObjectItem(j, "id");
+                cJSON *msg = cJSON_GetObjectItem(j, "message");
+                cJSON *ts = cJSON_GetObjectItem(j, "timestamp");
+                cJSON *branch = cJSON_GetObjectItem(j, "branch");
+                cJSON *sha = cJSON_GetObjectItem(j, "sha");
+                cJSON *nf = cJSON_GetObjectItem(j, "nfiles");
+                cJSON *snap = cJSON_GetObjectItem(j, "snapshot");
+                g_commits = realloc(g_commits, sizeof(commit_t) * (size_t)(g_ncommits + 1));
+                commit_t *c = &g_commits[g_ncommits];
+                c->id = xstrdup(id && id->valuestring ? id->valuestring : "commit");
+                c->message = xstrdup(msg && msg->valuestring ? msg->valuestring : "Untitled commit");
+                c->ts = ts && cJSON_IsNumber(ts) ? (long long)ts->valuedouble : now_ms();
+                c->branch = xstrdup(branch && branch->valuestring ? branch->valuestring : "main");
+                c->sha = (sha && sha->valuestring) ? xstrdup(sha->valuestring) : NULL;
+                c->nfiles = nf && cJSON_IsNumber(nf) ? (int)nf->valuedouble : (snap ? cJSON_GetArraySize(snap) : 0);
+                c->snapshot = snap ? cJSON_Duplicate(snap, 1) : NULL;
+                g_ncommits++;
+            }
+        }
+        if (arr) cJSON_Delete(arr);
+    }
+    free(copy);
+    vc_rebuild_visible();
+    pthread_mutex_unlock(&g_vc_mtx);
+}
+
+void vc_create_commit(const char *message) {
+    pthread_mutex_lock(&g_vc_mtx);
+    const char *msg = (message && message[0]) ? message : "Untitled commit";
+    char sha[64] = "";
+    char branch[128] = "main";
+    bool gitok = git_commit(g_active_path, msg, sha, sizeof(sha), branch, sizeof(branch));
+
+    int nfiles = 0;
+    char **files = ide_list_files(&nfiles);
+    ide_free_list(files, nfiles);
 
     g_commits = realloc(g_commits, sizeof(commit_t) * (size_t)(g_ncommits + 1));
     for (int i = g_ncommits; i > 0; i--) g_commits[i] = g_commits[i - 1];
-    g_commits[0].id = xasprintf("commit_%lld", (long long)now_ms());
-    g_commits[0].message = xstrdup(message && message[0] ? message : "Untitled commit");
-    g_commits[0].ts = now_ms();
-    g_commits[0].snapshot = snap;
+    commit_t *c = &g_commits[0];
+    c->id = xasprintf("commit_%lld", (long long)now_ms());
+    c->message = xstrdup(msg);
+    c->ts = now_ms();
+    c->branch = xstrdup(gitok ? branch : "main");
+    c->sha = gitok ? xstrdup(sha) : NULL;
+    c->nfiles = nfiles;
+    c->snapshot = gitok ? NULL : make_snapshot();
     g_ncommits++;
     vc_save_storage();
+    vc_rebuild_visible();
     pthread_mutex_unlock(&g_vc_mtx);
 }
 
@@ -313,43 +828,75 @@ bool vc_revert_to(const char *id) {
         if (!strcmp(g_commits[i].id, id)) { target = &g_commits[i]; break; }
     if (!target) { pthread_mutex_unlock(&g_vc_mtx); return false; }
 
-    cJSON *item = NULL;
-    cJSON_ArrayForEach(item, target->snapshot) {
-        if (cJSON_IsString(item) && item->valuestring) {
-            ide_write_file(item->string, item->valuestring);
+    if (target->sha && ide_git_available()) {
+        char *d = shq(g_active_path);
+        char *q = shq(target->sha);
+        bool ok = run_cmd("git -C %s reset --hard %s >/dev/null 2>&1", d, q);
+        free(d);
+        free(q);
+        pthread_mutex_unlock(&g_vc_mtx);
+        return ok;
+    }
+    if (target->snapshot) {
+        cJSON *item = NULL;
+        cJSON_ArrayForEach(item, target->snapshot) {
+            if (cJSON_IsString(item) && item->valuestring) {
+                ide_write_file(item->string, item->valuestring);
+            }
         }
+        pthread_mutex_unlock(&g_vc_mtx);
+        return true;
     }
     pthread_mutex_unlock(&g_vc_mtx);
-    return true;
+    return false;
 }
 
-int vc_count(void) { return g_ncommits; }
+static void vc_delete_branch_commits(const char *branch) {
+    pthread_mutex_lock(&g_vc_mtx);
+    int w = 0;
+    for (int i = 0; i < g_ncommits; i++) {
+        const char *b = g_commits[i].branch ? g_commits[i].branch : "main";
+        if (strcmp(b, branch) == 0) { commit_free(&g_commits[i]); continue; }
+        if (w != i) g_commits[w] = g_commits[i];
+        w++;
+    }
+    g_ncommits = w;
+    vc_save_storage();
+    vc_rebuild_visible();
+    pthread_mutex_unlock(&g_vc_mtx);
+}
+
+int vc_count(void) { return g_nvis; }
 
 char *vc_id(int idx) {
-    if (idx < 0 || idx >= g_ncommits) return NULL;
-    return xstrdup(g_commits[idx].id);
+    if (idx < 0 || idx >= g_nvis) return NULL;
+    return xstrdup(g_commits[g_vis[idx]].id);
 }
 
 char *vc_summary(int idx) {
-    if (idx < 0 || idx >= g_ncommits) return NULL;
-    commit_t *c = &g_commits[idx];
-    int nfiles = c->snapshot ? cJSON_GetArraySize(c->snapshot) : 0;
+    if (idx < 0 || idx >= g_nvis) return NULL;
+    commit_t *c = &g_commits[g_vis[idx]];
     char *ts = format_ts(c->ts);
-    char *out = xasprintf("%s (%d files) %s", c->message, nfiles, ts);
+    char *out;
+    if (c->sha)
+        out = xasprintf("%s (%.7s %s, %d files) %s", c->message, c->sha,
+                        c->branch ? c->branch : "main", c->nfiles, ts);
+    else
+        out = xasprintf("%s (%s, %d files) %s", c->message,
+                        c->branch ? c->branch : "main", c->nfiles, ts);
     free(ts);
     return out;
 }
 
 void vc_clear(void) {
     pthread_mutex_lock(&g_vc_mtx);
-    for (int i = 0; i < g_ncommits; i++) {
-        free(g_commits[i].id);
-        free(g_commits[i].message);
-        cJSON_Delete(g_commits[i].snapshot);
-    }
+    for (int i = 0; i < g_ncommits; i++) commit_free(&g_commits[i]);
     free(g_commits);
     g_commits = NULL;
     g_ncommits = 0;
+    free(g_vis);
+    g_vis = NULL;
+    g_nvis = 0;
     vc_save_storage();
     pthread_mutex_unlock(&g_vc_mtx);
 }
@@ -410,6 +957,26 @@ ide_bot_t *ide_bots_active(void) {
 }
 const char *ide_bot_active_id(void) { return g_active_bot_id; }
 
+static void bots_save_storage(void) {
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < g_nbots; i++) {
+        cJSON *j = cJSON_CreateObject();
+        cJSON_AddStringToObject(j, "id", g_bots[i].id);
+        cJSON_AddStringToObject(j, "name", g_bots[i].name);
+        cJSON_AddStringToObject(j, "prompt", g_bots[i].prompt);
+        cJSON_AddStringToObject(j, "model", g_bots[i].model);
+        cJSON_AddNumberToObject(j, "temp", g_bots[i].temp);
+        cJSON_AddItemToArray(arr, j);
+    }
+    char *json = cJSON_PrintUnformatted(arr);
+    if (json) {
+        storage_set("ide_custom_bots", json);
+        free(json);
+    }
+    cJSON_Delete(arr);
+    storage_save();
+}
+
 void ide_bot_save(ide_bot_t *bot) {
     if (bot->id && bot->id[0]) {
         for (int i = 0; i < g_nbots; i++) {
@@ -433,24 +1000,7 @@ void ide_bot_save(ide_bot_t *bot) {
         g_bots[g_nbots].temp = bot->temp;
         g_nbots++;
     }
-    /* persist */
-    cJSON *arr = cJSON_CreateArray();
-    for (int i = 0; i < g_nbots; i++) {
-        cJSON *j = cJSON_CreateObject();
-        cJSON_AddStringToObject(j, "id", g_bots[i].id);
-        cJSON_AddStringToObject(j, "name", g_bots[i].name);
-        cJSON_AddStringToObject(j, "prompt", g_bots[i].prompt);
-        cJSON_AddStringToObject(j, "model", g_bots[i].model);
-        cJSON_AddNumberToObject(j, "temp", g_bots[i].temp);
-        cJSON_AddItemToArray(arr, j);
-    }
-    char *json = cJSON_PrintUnformatted(arr);
-    if (json) {
-        storage_set("ide_custom_bots", json);
-        free(json);
-    }
-    cJSON_Delete(arr);
-    storage_save();
+    bots_save_storage();
 }
 
 void ide_bot_delete(int idx) {
@@ -465,25 +1015,7 @@ void ide_bot_delete(int idx) {
     free(g_bots[idx].model);
     for (int i = idx; i < g_nbots - 1; i++) g_bots[i] = g_bots[i + 1];
     g_nbots--;
-    ide_bot_save(NULL); /* persist (no-op for NULL id) */
-    /* persist again with full list */
-    cJSON *arr = cJSON_CreateArray();
-    for (int i = 0; i < g_nbots; i++) {
-        cJSON *j = cJSON_CreateObject();
-        cJSON_AddStringToObject(j, "id", g_bots[i].id);
-        cJSON_AddStringToObject(j, "name", g_bots[i].name);
-        cJSON_AddStringToObject(j, "prompt", g_bots[i].prompt);
-        cJSON_AddStringToObject(j, "model", g_bots[i].model);
-        cJSON_AddNumberToObject(j, "temp", g_bots[i].temp);
-        cJSON_AddItemToArray(arr, j);
-    }
-    char *json = cJSON_PrintUnformatted(arr);
-    if (json) {
-        storage_set("ide_custom_bots", json);
-        free(json);
-    }
-    cJSON_Delete(arr);
-    storage_save();
+    bots_save_storage();
 }
 
 void ide_bot_set_active(int idx) {
@@ -536,55 +1068,25 @@ bool ide_bots_import_json(const char *json) {
     return n > 0;
 }
 
-/* =================== agent chat =================== */
+/* =================== agent multi-chat sessions =================== */
 
-void agent_chat_init(agent_chat_t *c) {
-    memset(c, 0, sizeof(*c));
-    pthread_mutex_init(&c->mtx, NULL);
-}
-void agent_chat_free(agent_chat_t *c) {
-    pthread_mutex_destroy(&c->mtx);
-    agent_chat_clear(c);
-}
-void agent_chat_clear(agent_chat_t *c) {
-    pthread_mutex_lock(&c->mtx);
-    for (int i = 0; i < c->n; i++) {
-        free(c->msgs[i].role);
-        free(c->msgs[i].content);
-    }
-    free(c->msgs);
-    c->msgs = NULL;
-    c->n = 0;
-    pthread_mutex_unlock(&c->mtx);
-}
-int agent_chat_count(agent_chat_t *c) {
-    pthread_mutex_lock(&c->mtx);
-    int n = c->n;
-    pthread_mutex_unlock(&c->mtx);
-    return n;
-}
+static session_store_t g_agent_sessions;
+
+void agent_sessions_load(void) { session_store_init(&g_agent_sessions, "ide_agent_sessions"); session_store_load(&g_agent_sessions); }
+void agent_sessions_save(void) { session_store_save(&g_agent_sessions); }
+int  agent_sessions_count(void) { return session_store_count(&g_agent_sessions); }
+const char *agent_session_name(int idx) { return session_store_name(&g_agent_sessions, idx); }
+int  agent_session_current(void) { return session_store_current(&g_agent_sessions); }
+void agent_session_new(void) { session_store_new(&g_agent_sessions); }
+void agent_session_select(int idx) { session_store_select(&g_agent_sessions, idx); }
+void agent_session_rename(int idx, const char *name) { session_store_rename(&g_agent_sessions, idx, name); }
+void agent_session_delete(int idx) { session_store_delete(&g_agent_sessions, idx); }
+void agent_session_autoname(const char *text) { session_store_autoname(&g_agent_sessions, text); }
+void agent_session_clear(void) { session_store_clear(&g_agent_sessions); }
+agent_chat_t *agent_session_chat(void) { return session_store_chat(&g_agent_sessions); }
 
 static void agent_chat_push(agent_chat_t *c, const char *role, const char *content) {
-    pthread_mutex_lock(&c->mtx);
-    c->msgs = realloc(c->msgs, sizeof(agent_msg_t) * (size_t)(c->n + 1));
-    c->msgs[c->n].role = xstrdup(role);
-    c->msgs[c->n].content = xstrdup(content);
-    c->n++;
-    pthread_mutex_unlock(&c->mtx);
-}
-
-char *agent_chat_snapshot(agent_chat_t *c) {
-    pthread_mutex_lock(&c->mtx);
-    sbuf_t b;
-    sbuf_init(&b);
-    for (int i = 0; i < c->n; i++) {
-        sbuf_appendf(&b, "[%s] %s\n", c->msgs[i].role, c->msgs[i].content);
-        sbuf_append(&b, "\n");
-    }
-    pthread_mutex_unlock(&c->mtx);
-    char *out = sbuf_detach(&b);
-    sbuf_free(&b);
-    return out;
+    chatlog_push(c, role, content);
 }
 
 /* =================== agent tools =================== */
@@ -717,7 +1219,6 @@ static char *tool_edit_file(cJSON *args) {
         return json_errf("File not found: %s", path->valuestring);
     const char *repl = content && cJSON_IsString(content) && content->valuestring ? content->valuestring : "";
 
-    /* split body into 1-based numbered lines */
     char **lines = NULL;
     int nlines = 0;
     const char *p = body;
@@ -748,7 +1249,6 @@ static char *tool_edit_file(cJSON *args) {
         sbuf_append(&out, lines[i - 1]);
     }
     if (s > nlines && repl[0]) {
-        /* appending new lines at the end of the file */
         if (out.len) sbuf_append(&out, "\n");
         sbuf_append(&out, repl);
     }
@@ -773,8 +1273,18 @@ static char *tool_delete_file(cJSON *args) {
     return json_err("Cannot delete file (not found?)");
 }
 
+static char *tool_rename_path(cJSON *args) {
+    cJSON *oldp = cJSON_GetObjectItem(args, "old_path");
+    cJSON *newp = cJSON_GetObjectItem(args, "new_path");
+    if (!oldp || !cJSON_IsString(oldp) || !oldp->valuestring ||
+        !newp || !cJSON_IsString(newp) || !newp->valuestring)
+        return json_err("old_path and new_path (strings) required");
+    if (ide_rename_path(oldp->valuestring, newp->valuestring))
+        return json_okf("Renamed %s -> %s", oldp->valuestring, newp->valuestring);
+    return json_err("Cannot rename (invalid path, missing source, or target exists)");
+}
+
 static char *parse_tool_call(const char *text) {
-    /* find first '{' and matching balanced JSON */
     const char *open = strchr(text, '{');
     if (!open) return NULL;
     int depth = 0;
@@ -818,12 +1328,13 @@ static char *execute_tool(const char *tool_call) {
     else if (!strcmp(name, "write_file")) result = tool_write_file(args);
     else if (!strcmp(name, "edit_file")) result = tool_edit_file(args);
     else if (!strcmp(name, "delete_file")) result = tool_delete_file(args);
+    else if (!strcmp(name, "rename_path")) result = tool_rename_path(args);
     else result = json_errf("unknown tool: %s", name);
     cJSON_Delete(j);
     return result;
 }
 
-/* Build the OpenAI/Anthropic function-tool schemas for the six IDE tools. These are
+/* Build the OpenAI/Anthropic function-tool schemas for the IDE tools. These are
  * registered with the API so tool-capable backends (e.g. Groq) do not reject the
  * request with "Tool choice is none, but model called a tool" when the model emits
  * a native tool call. The local parser still accepts the text-JSON protocol too. */
@@ -838,6 +1349,21 @@ static void add_tool(cJSON *arr, const char *name, const char *desc, cJSON *para
     cJSON_AddItemToArray(arr, t);
 }
 
+static cJSON *params_one(const char *name, const char *type, const char *desc, bool required) {
+    cJSON *p = cJSON_CreateObject();
+    cJSON *props = cJSON_CreateObject();
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddStringToObject(d, "type", type);
+    cJSON_AddStringToObject(d, "description", desc);
+    cJSON_AddItemToObject(props, name, d);
+    cJSON_AddItemToObject(p, "properties", props);
+    if (required) {
+        const char *req[] = { name };
+        cJSON_AddItemToObject(p, "required", cJSON_CreateStringArray(req, 1));
+    }
+    return p;
+}
+
 static char *agent_tools_json(void) {
     cJSON *arr = cJSON_CreateArray();
 
@@ -850,25 +1376,10 @@ static char *agent_tools_json(void) {
     cJSON_AddItemToObject(p, "properties", props);
     add_tool(arr, "list_files", "List the files in the user's workspace (paths + languages).", p);
 
-    p = cJSON_CreateObject();
-    props = cJSON_CreateObject();
-    d = cJSON_CreateObject();
-    cJSON_AddStringToObject(d, "type", "string");
-    cJSON_AddStringToObject(d, "description", "relative file path");
-    cJSON_AddItemToObject(props, "path", d);
-    cJSON_AddItemToObject(p, "properties", props);
-    cJSON_AddItemToObject(p, "required", cJSON_CreateStringArray(&(const char *){"path"}, 1));
-    add_tool(arr, "read_file", "Read a file; returns its content as an array of numbered lines.", p);
-
-    p = cJSON_CreateObject();
-    props = cJSON_CreateObject();
-    d = cJSON_CreateObject();
-    cJSON_AddStringToObject(d, "type", "string");
-    cJSON_AddStringToObject(d, "description", "relative file path");
-    cJSON_AddItemToObject(props, "path", d);
-    cJSON_AddItemToObject(p, "properties", props);
-    cJSON_AddItemToObject(p, "required", cJSON_CreateStringArray(&(const char *){"path"}, 1));
-    add_tool(arr, "create_file", "Create a new empty file. Fails if the file already exists.", p);
+    add_tool(arr, "read_file", "Read a file; returns its content as an array of numbered lines.",
+             params_one("path", "string", "relative file path", true));
+    add_tool(arr, "create_file", "Create a new empty file. Fails if the file already exists.",
+             params_one("path", "string", "relative file path", true));
 
     p = cJSON_CreateObject();
     props = cJSON_CreateObject();
@@ -908,15 +1419,23 @@ static char *agent_tools_json(void) {
     cJSON_AddItemToObject(p, "required", cJSON_CreateStringArray(req2, 2));
     add_tool(arr, "edit_file", "Replace a range of lines in a file.", p);
 
+    add_tool(arr, "delete_file", "Delete a file.",
+             params_one("path", "string", "relative file path", true));
+
     p = cJSON_CreateObject();
     props = cJSON_CreateObject();
     d = cJSON_CreateObject();
     cJSON_AddStringToObject(d, "type", "string");
-    cJSON_AddStringToObject(d, "description", "relative file path");
-    cJSON_AddItemToObject(props, "path", d);
+    cJSON_AddStringToObject(d, "description", "current file or folder path");
+    cJSON_AddItemToObject(props, "old_path", d);
+    d = cJSON_CreateObject();
+    cJSON_AddStringToObject(d, "type", "string");
+    cJSON_AddStringToObject(d, "description", "new file or folder path");
+    cJSON_AddItemToObject(props, "new_path", d);
     cJSON_AddItemToObject(p, "properties", props);
-    cJSON_AddItemToObject(p, "required", cJSON_CreateStringArray(&(const char *){"path"}, 1));
-    add_tool(arr, "delete_file", "Delete a file.", p);
+    const char *req3[] = {"old_path", "new_path"};
+    cJSON_AddItemToObject(p, "required", cJSON_CreateStringArray(req3, 2));
+    add_tool(arr, "rename_path", "Rename or move a file or folder to a new path.", p);
 
     char *s = cJSON_PrintUnformatted(arr);
     cJSON_Delete(arr);
@@ -929,12 +1448,12 @@ static char *agent_tools_json(void) {
  * or, when finished, with a normal text answer. */
 static const char *BASE_AGENT_SYSTEM =
     "You are an autonomous AI coding agent running inside the Traliran AI IDE. "
-    "You can read, create, edit, and delete files in the user's workspace. "
+    "You can read, create, edit, rename, and delete files in the user's workspace. "
     "There are NO native function tools in the API - the IDE parses a JSON tool call "
     "directly from your reply text, so you must follow the protocol below exactly.\n\n"
     "RESPONSE FORMAT - use ONE of two mechanisms per reply (the IDE supports both):\n"
     "1) NATIVE tool calling: the functions list_files, read_file, create_file, write_file, "
-    "edit_file, delete_file are registered with the API. If you support native "
+    "edit_file, delete_file, rename_path are registered with the API. If you support native "
     "function/tool calls, call them directly (the IDE executes them and returns the result).\n"
     "2) TEXT JSON (works on every model): output ONLY a single JSON object, nothing before "
     "or after it (no markdown fences, no prose):\n"
@@ -949,7 +1468,8 @@ static const char *BASE_AGENT_SYSTEM =
     "1. The first turn gives you ONLY the list of files in the workspace - no contents.\n"
     "2. Call list_files to inspect, then read_file on every file whose content you need "
     "(contents are returned with 1-based line numbers).\n"
-    "3. Plan your changes, then apply them with create_file / write_file / edit_file / delete_file.\n"
+    "3. Plan your changes, then apply them with create_file / write_file / edit_file / "
+    "rename_path / delete_file.\n"
     "4. After editing, re-read the changed files to verify, then give your final summary.\n\n"
     "AVAILABLE TOOLS:\n"
     "1. {\"tool\": \"list_files\", \"arguments\": {\"directory\": \"\"}}\n"
@@ -965,7 +1485,9 @@ static const char *BASE_AGENT_SYSTEM =
     "given content. Leave other lines untouched. Set content to an empty string to simply "
     "delete those lines. Example: start_line 5, end_line 10 replaces lines 5 through 10.\n"
     "6. {\"tool\": \"delete_file\", \"arguments\": {\"path\": \"<relative path>\"}}\n"
-    "   -> Deletes a file.\n\n"
+    "   -> Deletes a file.\n"
+    "7. {\"tool\": \"rename_path\", \"arguments\": {\"old_path\": \"<path>\", \"new_path\": \"<path>\"}}\n"
+    "   -> Renames or moves a file or folder. The target must not already exist.\n\n"
     "RULES:\n"
     "- Never guess file contents - read the file first with read_file.\n"
     "- Always read a file before editing it so edit_file line numbers match.\n"
@@ -1055,7 +1577,9 @@ void *agent_worker(void *arg) {
         free(tools_json);
         free(messages_json);
         if (rc != 0) {
-            agent_chat_push(a->chat, "assistant", xasprintf("Error: %s", res.content ? res.content : "API error"));
+            char *err = xasprintf("Error: %s", res.content ? res.content : "API error");
+            agent_chat_push(a->chat, "assistant", err);
+            free(err);
             api_result_free(&res);
             break;
         }
@@ -1074,7 +1598,9 @@ void *agent_worker(void *arg) {
             cJSON_AddStringToObject(m, "role", "user");
             cJSON_AddStringToObject(m, "content", note);
             cJSON_AddItemToArray(arr, m);
-            agent_chat_push(a->chat, "assistant", xasprintf("🔧 %s", note));
+            char *disp = xasprintf("🔧 %s", note);
+            agent_chat_push(a->chat, "assistant", disp);
+            free(disp);
             free(note);
             free(result);
             cJSON_Delete(tj);
@@ -1097,4 +1623,23 @@ void *agent_worker(void *arg) {
     free(sys);
     free(initial_ctx);
     return NULL;
+}
+
+/* =================== init =================== */
+
+void ide_init(void) {
+    ensure_dirs();
+    ide_repos_load();
+    mkdir_p(ide_repo_active_path());
+
+    int n = 0;
+    char **list = ide_list_files(&n);
+    /* Seed starter files only for the migrated main workspace on first run. */
+    if (n == 0 && !strcmp(g_active_repo_id, "repo_main")) {
+        ide_write_file("README.md", "# Welcome to Traliran AI IDE\n\nStart coding! The AI agent can help you.\n");
+        ide_write_file("index.html", "<!DOCTYPE html>\n<html>\n<head>\n    <title>My App</title>\n</head>\n<body>\n    <h1>Hello World</h1>\n    <script src=\"app.js\"></script>\n</body>\n</html>\n");
+        ide_write_file("app.js", "// Your JavaScript code here\nconsole.log(\"Hello from AI IDE!\");\n");
+        ide_write_file("styles.css", "/* Your styles here */\nbody {\n    font-family: system-ui;\n    margin: 2rem;\n}\n");
+    }
+    ide_free_list(list, n);
 }

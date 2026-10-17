@@ -775,7 +775,7 @@ bool tui_prompt(const char *title, const char *initial, char *out, size_t outsz)
 
 /* ---------- file picker ---------- */
 
-bool tui_pick_file(const char *title, char *out, size_t outsz) {
+static bool pick_path(const char *title, const char *start, char *out, size_t outsz, bool dir_mode) {
     int h = LINES - 8, w = 72;
     if (w > COLS - 4) w = COLS - 4;
     if (h < 8) h = 8;
@@ -783,6 +783,7 @@ bool tui_pick_file(const char *title, char *out, size_t outsz) {
 
     char cwd[4096];
     if (!getcwd(cwd, sizeof(cwd))) strcpy(cwd, "/");
+    if (start && start[0] == '/') snprintf(cwd, sizeof(cwd), "%s", start);
 
     WINDOW *win = tui_win(h, w, y0, x0);
     tui_box(win, title);
@@ -861,7 +862,9 @@ bool tui_pick_file(const char *title, char *out, size_t outsz) {
             in_draw(&in, pathwin, 0, 0, w - 2);
         } else {
             werase(pathwin);
-            mvwprintw(pathwin, 0, 0, "%.*s", w - 2, "Enter: open/select   [d]: type path   Esc: cancel");
+            mvwprintw(pathwin, 0, 0, "%.*s", w - 2, dir_mode
+                      ? "Enter: open   [s]: select this folder   [d]: type path   Esc: cancel"
+                      : "Enter: open/select   [d]: type path   Esc: cancel");
         }
         wrefresh(pathwin);
         wrefresh(win);
@@ -873,10 +876,16 @@ bool tui_pick_file(const char *title, char *out, size_t outsz) {
                 char *p = str_trim(in.buf);
                 if (p[0] == '/') {
                     struct stat st;
-                    if (stat(p, &st) == 0 && S_ISDIR(st.st_mode)) {
+                    bool exists = (stat(p, &st) == 0);
+                    if (dir_mode) {
+                        /* Accept any absolute path (a new folder may be created). */
+                        snprintf(out, outsz, "%s", p);
+                        result = true;
+                        done = true;
+                    } else if (exists && S_ISDIR(st.st_mode)) {
                         snprintf(cwd, sizeof(cwd), "%s", p);
                         in_set(&in, "");
-                    } else if (stat(p, &st) == 0 && S_ISREG(st.st_mode)) {
+                    } else if (exists && S_ISREG(st.st_mode)) {
                         snprintf(out, outsz, "%s", p);
                         result = true;
                         done = true;
@@ -911,6 +920,11 @@ bool tui_pick_file(const char *title, char *out, size_t outsz) {
                 result = true;
                 done = true;
             }
+        } else if (dir_mode && (ch == 's' || ch == 'S')) {
+            /* pick the folder currently open */
+            snprintf(out, outsz, "%s", cwd);
+            result = true;
+            done = true;
         } else if (ch == 'd' || ch == '/') {
             in_path = true;
             in_set(&in, cwd);
@@ -922,4 +936,12 @@ bool tui_pick_file(const char *title, char *out, size_t outsz) {
     delwin(pathwin);
     delwin(win);
     return result;
+}
+
+bool tui_pick_file(const char *title, char *out, size_t outsz) {
+    return pick_path(title, NULL, out, outsz, false);
+}
+
+bool tui_pick_dir(const char *title, const char *start, char *out, size_t outsz) {
+    return pick_path(title, start, out, outsz, true);
 }

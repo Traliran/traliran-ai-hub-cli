@@ -1,11 +1,34 @@
 /*
- * ide.h - AI IDE: VFS on disk, version control, custom bots, agent tools.
+ * ide.h - AI IDE: VFS on disk, multi-repository workspaces, real-git version
+ * control, custom bots, agent tools, and multi-chat agent sessions.
  */
 #ifndef HUB_IDE_H
 #define HUB_IDE_H
 
 #include <pthread.h>
 #include <stdbool.h>
+
+#include "sessions.h"
+
+/* ---------- repositories (each one is a real folder on disk) ---------- */
+void        ide_repos_load(void);              /* load index, migrate legacy workspace */
+int         ide_repos_count(void);
+const char *ide_repo_name(int idx);            /* "" when out of range */
+const char *ide_repo_path(int idx);            /* "" when out of range */
+int         ide_repo_active_index(void);
+const char *ide_repo_active_path(void);        /* active repo folder (never NULL) */
+void        ide_repo_create(const char *name, const char *path);
+void        ide_repo_switch(int idx);
+void        ide_repo_remove(int idx);          /* forget repo; files on disk are kept */
+
+/* ---------- branches (real git under the active repo) ---------- */
+bool   ide_git_available(void);
+char  *ide_branch_current(void);               /* malloc'd ("" if unknown) */
+char **ide_branch_list(int *n);                /* malloc'd list of names */
+void   ide_branch_free_list(char **list, int n);
+bool   ide_branch_create(const char *name);
+bool   ide_branch_switch(const char *name);
+bool   ide_branch_delete(const char *name);    /* also drops that branch's stored commits */
 
 /* ---------- VFS ---------- */
 void        ide_init(void);                    /* ensure workspace + defaults */
@@ -15,18 +38,20 @@ char       *ide_read_file(const char *path);   /* malloc'd or NULL */
 bool        ide_write_file(const char *path, const char *content);
 bool        ide_delete_file(const char *path);
 bool        ide_delete_folder(const char *path);
+bool        ide_new_file(const char *path);    /* refuse overwrite */
+bool        ide_new_folder(const char *path);  /* mkdir -p; empty folders show once they hold files */
+bool        ide_rename_path(const char *old_path, const char *new_path);
 const char *ide_language(const char *path);
-bool        ide_new_file(const char *path);    /* refuse overwrite unless empty */
 char       *ide_file_tree_text(void);          /* compact tree for agent context */
 bool        ide_export_project(const char *path);
 bool        ide_import_project(const char *path);
 
-/* ---------- version control ---------- */
+/* ---------- version control (git-backed snapshots) ---------- */
 void   vc_load(void);
 void   vc_create_commit(const char *message);
 bool   vc_revert_to(const char *id);
-int    vc_count(void);
-char  *vc_summary(int idx);                    /* malloc'd "message (files) YYYY-MM-DD" */
+int    vc_count(void);                          /* commits on the active branch */
+char  *vc_summary(int idx);                     /* malloc'd "message (sha · branch · files) date" */
 char  *vc_id(int idx);
 void   vc_clear(void);
 
@@ -51,22 +76,21 @@ char      *ide_bots_export_json(void);
 bool       ide_bots_import_json(const char *json);
 
 /* ---------- agent chat ---------- */
-typedef struct {
-    char *role;
-    char *content;
-} agent_msg_t;
+typedef chatlog_t agent_chat_t;
 
-typedef struct {
-    agent_msg_t  *msgs;
-    int           n;
-    pthread_mutex_t mtx;
-} agent_chat_t;
-
-void  agent_chat_init(agent_chat_t *c);
-void  agent_chat_free(agent_chat_t *c);
-void  agent_chat_clear(agent_chat_t *c);
-char *agent_chat_snapshot(agent_chat_t *c);    /* rendered-ish plain text */
-int   agent_chat_count(agent_chat_t *c);
+/* ---------- agent multi-chat sessions ---------- */
+void         agent_sessions_load(void);
+void         agent_sessions_save(void);
+int          agent_sessions_count(void);
+const char  *agent_session_name(int idx);
+int          agent_session_current(void);
+void         agent_session_new(void);
+void         agent_session_select(int idx);
+void         agent_session_rename(int idx, const char *name);
+void         agent_session_delete(int idx);
+void         agent_session_autoname(const char *text);
+void         agent_session_clear(void);
+agent_chat_t *agent_session_chat(void);        /* active log or NULL */
 
 /* run the agent tool-loop (blocking; call from worker thread) */
 typedef struct {
